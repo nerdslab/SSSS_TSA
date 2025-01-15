@@ -1,4 +1,4 @@
-#Time Series Domain Adaptation via Channel-Selective Representation Alignment
+# Time Series Domain Adaptation via Channel-Selective Representation Alignment
 
 
 
