@@ -13,13 +13,16 @@ This repository provides code for our TMLR manuscript [Time Series Domain Adapta
 
 ## Running code
 
-Please run main.py . Choose SSSS_TSA as the argument to ---da_method
+The file "main.py" is the entry point for running all code. This file takes in different arguments such as the type of method, the dataset to run on, etc.
 
+To run our method on the *WISDM* dataset, please use:
+
+python main.py --da_method main.py --dataset "WISDM"
 
 This code has been adapted from the  [Adatime benchmarking suite ](https://github.com/emadeldeen24/AdaTime)
 
 
-## Contact
+### Contact
 
 For all questions and comments, please contact Nauman at his Github [nahad3](https://github.com/nahad3) 
 
