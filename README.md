@@ -15,7 +15,7 @@ This repository provides code for our TMLR manuscript [Time Series Domain Adapta
 
 The file "main.py" is the entry point for running all code. This file takes in different arguments such as the type of method, the dataset to run on, etc.
 
-To run our method on the *WISDM* dataset, please use:
+For example, to run our method on the *WISDM* dataset, please use:
 
 ```console
 python main.py --da_method main.py --dataset "WISDM"
