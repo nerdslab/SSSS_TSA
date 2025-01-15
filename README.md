@@ -17,7 +17,9 @@ The file "main.py" is the entry point for running all code. This file takes in d
 
 To run our method on the *WISDM* dataset, please use:
 
+```console
 python main.py --da_method main.py --dataset "WISDM"
+```
 
 This code has been adapted from the  [Adatime benchmarking suite ](https://github.com/emadeldeen24/AdaTime)
 
