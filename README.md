@@ -19,6 +19,8 @@ Please run main.py . Choose SSSS_TSA as the argument to ---da_method
 This code has been adapted from the  [Adatime benchmarking suite ](https://github.com/emadeldeen24/AdaTime)
 
 
+## Contributor
+- Nauman Ahad
 For all questions and comments, please contact:
   Github: [nahad3](https://github.com/nahad3) 
 
