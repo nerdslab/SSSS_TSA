@@ -20,7 +20,6 @@ This code has been adapted from the  [Adatime benchmarking suite ](https://githu
 
 
 ## Contributor
-- Nauman Ahad
-For all questions and comments, please contact:
-  Github: [nahad3](https://github.com/nahad3) 
+
+For all questions and comments, please contact Nauman at his Github [nahad3](https://github.com/nahad3) 
 
