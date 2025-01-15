@@ -2,7 +2,7 @@
 
 
 
-This repository provides code for our TMLR manuscript "Time Series Domain Adaptation via Channel-Selective Representation Alignment", which can be found at: https://openreview.net/pdf?id=8C8LJIqF4y.
+This repository provides code for our TMLR manuscript [Time Series Domain Adaptation via Channel-Selective Representation Alignment](https://openreview.net/pdf?id=8C8LJIqF4y).
 
 ## Requirements
 
@@ -18,4 +18,7 @@ Please run main.py . Choose SSSS_TSA as the argument to ---da_method
 
 This code has been adapted from the  [Adatime benchmarking suite ](https://github.com/emadeldeen24/AdaTime)
 
+
+For all questions and comments, please contact:
+  Github: [nahad3](https://github.com/nahad3) 
 
