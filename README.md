@@ -18,7 +18,7 @@ The file "main.py" is the entry point for running all code. This file takes in d
 For example, to run our method on the [*WISDM*](https://www.cis.fordham.edu/wisdm/dataset.php) dataset, please use:
 
 ```console
-python main.py --da_method main.py --dataset "WISDM"
+python main.py --da_method "SSSS_TSA" --dataset "WISDM"
 ```
 
 This code has been adapted from the  [Adatime benchmarking suite ](https://github.com/emadeldeen24/AdaTime)
