@@ -6,11 +6,10 @@ from torch.nn.utils import weight_norm
 import torch.nn.functional as F
 import torch.fft as FFT
 from models.multihead_attention import MultiHeadAttention as Multihead2
-# from utils import weights_init
-from CLUDA_main.utils.tcn_no_norm import TemporalConvNet
+
 from CLUDA_main.utils.nearest_neighbor import NN, sim_matrix
 from CLUDA_main.utils.mlp import MLP
-
+import time
 
 def get_backbone_class(backbone_name):
     """Return the algorithm class with the given name."""
@@ -63,7 +62,50 @@ class CNN(nn.Module):
 
         return F.normalize(x_flat)
 
+    def get_batch_norm_stats_init(self):
+        layer1_bnorm = self.conv_block1[1]
+        layer2_bnorm = self.conv_block2[1]
+        layer3_bnorm = self.conv_block3[1]
 
+
+        return [[layer1_bnorm.running_mean,layer1_bnorm.running_var],[layer2_bnorm.running_mean,layer2_bnorm.running_var],[layer3_bnorm.running_mean,layer3_bnorm.running_var]]
+
+    def get_batch_norm_stats_layer1(self,x):
+        z = self.conv_block1[0](x)
+        z2 = self.conv_block1[1](z)
+        a = self.conv_block1[1]
+        return [a.running_mean,a.running_var]
+
+    def get_batch_norm_stats_layer2(self,x):
+        x_1 = self.conv_block1(x)
+        z = self.conv_block2[0](x_1 )
+        z2 = self.conv_block2[1](z)
+        a = self.conv_block2[1]
+        return [a.running_mean,a.running_var]
+
+    def get_batch_norm_stats_layer3(self,x):
+        x_1 = self.conv_block1(x)
+        x2 = self.conv_block2(x_1)
+        z = self.conv_block3[0](x2)
+        z2 = self.conv_block3[1](z)
+        a = self.conv_block3[1]
+        return [a.running_mean,a.running_var]
+
+
+    def set_1st_layer_batchnorm(self,mean,var):
+        a = self.conv_block1[1]
+        a.running_mean = mean
+        a.running_var = var
+
+    def set_2nd_layer_batchnorm(self,mean,var):
+        a = self.conv_block2[1]
+        a.running_mean = mean
+        a.running_var = var
+
+    def set_3rd_layer_batchnorm(self,mean,var):
+        a = self.conv_block3[1]
+        a.running_mean = mean
+        a.running_var = var
 class classifier2(nn.Module):
     def __init__(self, configs,emb_dims):
         super(classifier2, self).__init__()
@@ -360,7 +402,9 @@ class SpectralConv1d(nn.Module):
     def forward(self, x):
         batchsize = x.shape[0]
         # Compute Fourier coeffcients up to factor of e^(- something constant)
-        x = torch.cos(x)
+
+        #why the cosine?
+        #x = torch.cos(x)
         x_ft = torch.fft.rfft(x, norm='ortho')
         out_ft = torch.zeros(batchsize, self.out_channels, x.size(-1) // 2 + 1, device=x.device, dtype=torch.cfloat)
         out_ft[:, :, :self.modes1] = self.compl_mul1d(x_ft[:, :, :self.modes1], self.weights1)
@@ -409,7 +453,10 @@ class SepReps_with_multihead(nn.Module):
         rep_list =[]
         for k in range(0,self.no_channels):
             x_k = x[:,k,:].unsqueeze(1)
+            t_1= time.time()
             rep_list.append(F.normalize(self.backbone_nets[k](x_k),dim=1))
+            t_2 = time.time()
+            #print("here")
         rep_all = torch.stack(rep_list,dim=1)
         rep_comb,_ = self.multihead_attention(rep_all,rep_all,rep_all)
 
@@ -428,7 +475,9 @@ class SepReps_with_multihead(nn.Module):
         for k in range(0, self.no_channels):
             x_k = x[:, k, :].unsqueeze(1)
             #rep_list.append(self.backbone_nets[k](x_k))
+            t_1 = time.time()
             rep_list.append(F.normalize(self.backbone_nets[k](x_k), dim=1))
+            t_2 = time.time()
         rep_all = torch.stack(rep_list, dim=1)
         rep_comb, rep_attn = self.multihead_attention(rep_all, rep_all, rep_all)
         rep_comb = rep_comb.reshape(rep_comb.shape[0], -1)
@@ -440,8 +489,9 @@ class SepReps_with_multihead(nn.Module):
         rep_list = []
         for k in range(0, self.no_channels):
             x_k = x[:, k, :].unsqueeze(1)
-
+            s_1 = time.time()
             rep_list.append(F.normalize(self.backbone_nets[k](x_k),dim=1))
+            s_2 = time.time()
             #rep_list.append(x_k[:,:,0:64].squeeze(1))
         rep_all = torch.stack(rep_list, dim=1)
         rep_comb, rep_attn = self.multihead_attention(rep_all, rep_all, rep_all)
@@ -458,6 +508,82 @@ class SepReps_with_multihead(nn.Module):
         #rep_comb = self.ff_attent(rep_comb)
         return rep_comb,rep_attn
 
+class SepRepsComEnc_with_multihead(nn.Module):
+    'code to get separate reps and combine through a multi attention head across channels'
+    def __init__(self, configs,backbonenet):
+        super(SepRepsComEnc_with_multihead, self).__init__()
+        self.no_channels = configs.input_channels
+        self.backbone_nets =  nn.ModuleList([])
+
+        #for k in range(0,self.no_channels):
+        #    configs.input_channels = 1
+        #    self.backbone_nets.append(backbonenet(configs))
+        #Only one channel
+        for k in range(0, 1):
+                configs.input_channels = 1
+                self.backbone_nets.append(backbonenet(configs))
+            #self.backbone_nets.append(simple_average_feed_forward(configs))
+
+        #self.multihead_attention  = nn.MultiheadAttention( configs.final_out_channels ,num_heads=1,batch_first=True,bias=False)
+        self.multihead_attention =  Multihead2( configs.final_out_channels ,head_num=1,bias=False,temp=configs.temp)
+        self.ff_attent = nn.Sequential(nn.Linear(configs.final_out_channels*self.no_channels,configs.final_out_channels*self.no_channels)
+                                       ,nn.ReLU(),nn.Linear(configs.final_out_channels*self.no_channels,configs.final_out_channels*self.no_channels))
+        self.ff_attent2 = nn.Sequential(
+            nn.Linear(configs.final_out_channels * self.no_channels, configs.final_out_channels * self.no_channels)
+            , nn.ReLU(),
+            nn.Linear( configs.final_out_channels * self.no_channels,configs.final_out_channels * self.no_channels))
+    def forward(self,x):
+        rep_list =[]
+        for k in range(0,self.no_channels):
+            x_k = x[:,k,:].unsqueeze(1)
+            rep_list.append(F.normalize(self.backbone_nets[0](x_k),dim=1))
+        rep_all = torch.stack(rep_list,dim=1)
+        rep_comb,_ = self.multihead_attention(rep_all,rep_all,rep_all)
+
+        #rep_comb2 = rep_comb+rep_all
+        rep_comb = rep_comb.reshape(rep_comb.shape[0],-1)
+
+
+        #rep_comb
+        #rep_comb = self.ff_attent(rep_comb)
+        #rep_comb3 = rep_comb2 + self.ff_attent2(rep_comb2)
+        rep_list = []
+        return rep_comb
+
+    def fetch_att_weights(self,x):
+        rep_list = []
+        for k in range(0, self.no_channels):
+            x_k = x[:, k, :].unsqueeze(1)
+            #rep_list.append(self.backbone_nets[k](x_k))
+            rep_list.append(F.normalize(self.backbone_nets[0](x_k), dim=1))
+        rep_all = torch.stack(rep_list, dim=1)
+        rep_comb, rep_attn = self.multihead_attention(rep_all, rep_all, rep_all)
+        rep_comb = rep_comb.reshape(rep_comb.shape[0], -1)
+        rep_comb = self.ff_attent(rep_comb)
+        return rep_attn
+
+
+    def fetch_individual_reps(self,x):
+        rep_list = []
+        for k in range(0, self.no_channels):
+            x_k = x[:, k, :].unsqueeze(1)
+
+            rep_list.append(F.normalize(self.backbone_nets[0](x_k),dim=1))
+            #rep_list.append(x_k[:,:,0:64].squeeze(1))
+        rep_all = torch.stack(rep_list, dim=1)
+        rep_comb, rep_attn = self.multihead_attention(rep_all, rep_all, rep_all)
+        #rep_comb = rep_comb.reshape(rep_comb.shape[0], -1)
+        #rep_comb = self.ff_attent(rep_comb)
+        return rep_list
+
+    def combine_ind_through_attn(self,rep_list):
+        'takes in a list of representations'
+
+        rep_all = torch.stack(rep_list, dim=1).detach()
+        rep_comb, rep_attn = self.multihead_attention(rep_all, rep_all, rep_all)
+        rep_comb = rep_comb.reshape(rep_comb.shape[0], -1)
+        #rep_comb = self.ff_attent(rep_comb)
+        return rep_comb,rep_attn
 
 class SepReps_with_sum(nn.Module):
     'code to get separate reps and combine through summing them'
@@ -1033,3 +1159,191 @@ class CLUDA_NN(nn.Module):
         y = self.predictor(q, static)
 
         return y
+
+
+class CNN_ATTN(nn.Module):
+    def __init__(self, configs):
+        super(CNN_ATTN, self).__init__()
+
+        self.conv_block1 = nn.Sequential(
+            nn.Conv1d(configs.input_channels, configs.mid_channels, kernel_size=configs.kernel_size,
+                      stride=configs.stride, bias=False, padding=(configs.kernel_size // 2)),
+            nn.BatchNorm1d(configs.mid_channels),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2, padding=1),
+            nn.Dropout(configs.dropout)
+        )
+
+        self.conv_block2 = nn.Sequential(
+            nn.Conv1d(configs.mid_channels, configs.mid_channels * 2, kernel_size=8, stride=1, bias=False, padding=4),
+            nn.BatchNorm1d(configs.mid_channels * 2),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2, padding=1)
+        )
+
+        self.conv_block3 = nn.Sequential(
+            nn.Conv1d(configs.mid_channels * 2, configs.final_out_channels, kernel_size=8, stride=1, bias=False,
+                      padding=4),
+            nn.BatchNorm1d(configs.final_out_channels),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2, padding=1),
+        )
+
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(configs.features_len)
+        self.attn_network = attn_network(configs)
+        self.sparse_max = Sparsemax(dim=-1)
+        self.feat_len = configs.features_len
+
+    def forward(self, x_in):
+        x = self.conv_block1(x_in)
+        x = self.conv_block2(x)
+        x = self.conv_block3(x)
+        x = self.adaptive_pool(x)
+        x_flat = x.reshape(x.shape[0], -1)
+        attentive_feat = self.calculate_attentive_feat(x_flat)
+        return attentive_feat
+
+    def self_attention(self, Q, K, scale=True, sparse=True, k=3):
+
+        attention_weight = torch.bmm(Q.view(Q.shape[0], self.feat_len, -1), K.view(K.shape[0], -1, self.feat_len))
+
+        attention_weight = torch.mean(attention_weight, dim=2, keepdim=True)
+
+        if scale:
+            d_k = torch.tensor(K.shape[-1]).float()
+            attention_weight = attention_weight / torch.sqrt(d_k)
+        if sparse:
+            attention_weight_sparse = self.sparse_max(torch.reshape(attention_weight, [-1, self.feat_len]))
+            attention_weight = torch.reshape(attention_weight_sparse, [-1, attention_weight.shape[1],
+                                                                       attention_weight.shape[2]])
+        else:
+            attention_weight = self.softmax(attention_weight)
+
+        return attention_weight
+
+    def attention_fn(self, Q, K, scaled=False, sparse=True, k=1):
+
+        attention_weight = torch.matmul(F.normalize(Q, p=2, dim=-1),
+                                        F.normalize(K, p=2, dim=-1).view(K.shape[0], K.shape[1], -1, self.feat_len))
+
+        if scaled:
+            d_k = torch.tensor(K.shape[-1]).float()
+            attention_weight = attention_weight / torch.sqrt(d_k)
+            attention_weight = k * torch.log(torch.tensor(self.feat_len, dtype=torch.float32)) * attention_weight
+
+        if sparse:
+            attention_weight_sparse = self.sparse_max(torch.reshape(attention_weight, [-1, self.feat_len]))
+
+            attention_weight = torch.reshape(attention_weight_sparse, attention_weight.shape)
+        else:
+            attention_weight = self.softmax(attention_weight)
+
+        return attention_weight
+
+    def calculate_attentive_feat(self, candidate_representation_xi):
+        Q_xi, K_xi, V_xi = self.attn_network(candidate_representation_xi)
+        intra_attention_weight_xi = self.self_attention(Q=Q_xi, K=K_xi, sparse=True)
+        Z_i = torch.bmm(intra_attention_weight_xi.view(intra_attention_weight_xi.shape[0], 1, -1),
+                        V_xi.view(V_xi.shape[0], self.feat_len, -1))
+        final_feature = F.normalize(Z_i, dim=-1).view(Z_i.shape[0],-1)
+
+        return final_feature
+
+class attn_network(nn.Module):
+    def __init__(self, configs):
+        super(attn_network, self).__init__()
+
+        self.h_dim = configs.features_len * configs.final_out_channels
+        self.self_attn_Q = nn.Sequential(nn.Linear(in_features=self.h_dim, out_features=self.h_dim),
+                                         nn.ELU()
+                                         )
+        self.self_attn_K = nn.Sequential(nn.Linear(in_features=self.h_dim, out_features=self.h_dim),
+                                         nn.LeakyReLU()
+                                         )
+        self.self_attn_V = nn.Sequential(nn.Linear(in_features=self.h_dim, out_features=self.h_dim),
+                                         nn.LeakyReLU()
+                                         )
+
+    def forward(self, x):
+        Q = self.self_attn_Q(x)
+        K = self.self_attn_K(x)
+        V = self.self_attn_V(x)
+
+        return Q, K, V
+
+
+    # Sparse max
+class Sparsemax(nn.Module):
+    """Sparsemax function."""
+
+    def __init__(self, dim=None):
+        """Initialize sparsemax activation
+
+        Args:
+            dim (int, optional): The dimension over which to apply the sparsemax function.
+        """
+        super(Sparsemax, self).__init__()
+
+        self.dim = -1 if dim is None else dim
+
+    def forward(self, input):
+        """Forward function.
+        Args:
+            input (torch.Tensor): Input tensor. First dimension should be the batch size
+        Returns:
+            torch.Tensor: [batch_size x number_of_logits] Output tensor
+        """
+        # Sparsemax currently only handles 2-dim tensors,
+        # so we reshape to a convenient shape and reshape back after sparsemax
+        input = input.transpose(0, self.dim)
+        original_size = input.size()
+        input = input.reshape(input.size(0), -1)
+        input = input.transpose(0, 1)
+        dim = 1
+
+        number_of_logits = input.size(dim)
+
+        # Translate input by max for numerical stability
+        input = input - torch.max(input, dim=dim, keepdim=True)[0].expand_as(input)
+
+        # Sort input in descending order.
+        # (NOTE: Can be replaced with linear time selection method described here:
+        # http://stanford.edu/~jduchi/projects/DuchiShSiCh08.html)
+        zs = torch.sort(input=input, dim=dim, descending=True)[0]
+        range = torch.arange(start=1, end=number_of_logits + 1, step=1, device=input.device, dtype=input.dtype).view(1,
+                                                                                                                     -1)
+        range = range.expand_as(zs)
+
+        # Determine sparsity of projection
+        bound = 1 + range * zs
+        cumulative_sum_zs = torch.cumsum(zs, dim)
+        is_gt = torch.gt(bound, cumulative_sum_zs).type(input.type())
+        k = torch.max(is_gt * range, dim, keepdim=True)[0]
+
+        # Compute threshold function
+        zs_sparse = is_gt * zs
+
+        # Compute taus
+        taus = (torch.sum(zs_sparse, dim, keepdim=True) - 1) / k
+        taus = taus.expand_as(input)
+
+        # Sparsemax
+        self.output = torch.max(torch.zeros_like(input), input - taus)
+
+        # Reshape back to original shape
+        output = self.output
+        output = output.transpose(0, 1)
+        output = output.reshape(original_size)
+        output = output.transpose(0, self.dim)
+
+        return output
+
+    def backward(self, grad_output):
+        """Backward function."""
+        dim = 1
+
+        nonzeros = torch.ne(self.output, 0)
+        sum = torch.sum(grad_output * nonzeros, dim=dim) / torch.sum(nonzeros, dim=dim)
+        self.grad_input = nonzeros * (grad_output - sum.expand_as(grad_output))
+
+        return self.grad_input

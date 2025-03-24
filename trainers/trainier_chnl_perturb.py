@@ -7,7 +7,7 @@ from models.loss import SinkhornDistance, LOT
 import pandas as pd
 import numpy as np
 import warnings
-import wandb
+
 import json
 import random
 import sklearn.exceptions
@@ -37,7 +37,21 @@ from torch import nn
 torch.backends.cudnn.benchmark = True
 np.warnings.filterwarnings('ignore', category=np.VisibleDeprecationWarning)
 
+def get_percent_selection(array_weights,corrupted_channels,thresh=0.15):
+    weights = torch.diagonal(array_weights, dim1=1, dim2=2)
+    weights_filtered = weights[:,corrupted_channels]
+    corruputed_weights_count = torch.zeros(corrupted_channels.shape)
+    weights_filtered[weights_filtered >=thresh] = 1
+    weights_filtered[weights_filtered <= thresh] = 0
+    large_weight_corrupt = torch.sum(weights_filtered)
 
+    weights_orig = torch.diagonal(array_weights, dim1=1, dim2=2)
+    weights_filtered = weights_orig[:, corrupted_channels]
+    list_cut_off = [0,0.10,0.20,0.30,0.40,0.50,0.65,0.70,0.80,0.90,1.0]
+
+    counts, bin_edges = np.histogram(weights_filtered.cpu().numpy() , list_cut_off)
+
+    return large_weight_corrupt,weights_filtered.shape[0]*weights_filtered.shape[1],counts
 def balance_samples(x, y):
     no_labels = torch.unique(y)
     no_labels_lens = []
@@ -101,7 +115,11 @@ class cross_domain_trainer(object):
         self.save_dir = args.save_dir
         self.data_path = os.path.join(args.data_path, self.dataset)
         self.create_save_dir()
+        self.src_weight_wrong_selection_count = []
+        self.src_weight_wrong_selection_all = []
 
+        self.trg_weight_wrong_selection_count = []
+        self.trg_weight_wrong_selection_all = []
         # Specify runs
         self.num_runs = args.num_runs
 
@@ -160,17 +178,14 @@ class cross_domain_trainer(object):
 
         result_dict = {}
 
-        os.environ["WANDB_SILENT"] = "true"
-        os.environ['WANDB_DISABLED'] = "false"
+
         config_vars = vars(args)
         config_dataset = vars(self.dataset_configs)
         config_run = self.default_hparams
         balanced = config_dataset['balanced']
         config = config_vars
-        # config = config.update(config_run)
-        # wandb.config = omegaconf.OmegaConf.to_container(
-        #    cfg, resolve=True, throw_on_missing=True
-        # )
+
+
         now = datetime.now()
         dt_string = now.strftime("%d_%m_%YTime_%H:%M:%S")
 
@@ -185,8 +200,8 @@ class cross_domain_trainer(object):
             self.dataset = f"{self.dataset}'_drop_chnl_{self.no_channel_affect}"
         elif self.satur_chnl:
             self.dataset = f"{self.dataset}'_satur_chnl_{self.no_channel_affect}"
-        wandb_name = self.da_method + '_' + self.dataset + '_' + dt_string
-        wandb.init(config=config, project="Domain_Adapt", name=wandb_name)
+        exp_name = self.da_method + '_' + self.dataset + '_' + dt_string
+
         run_name = f"{self.run_description}"
         self.hparams = self.default_hparams
         # Logging
@@ -207,7 +222,7 @@ class cross_domain_trainer(object):
             path_string = f"./results/drop_channels/"
         result_path = Path(path_string)
         result_path.mkdir(parents=True, exist_ok=True)
-        result_path= f"{result_path}/{wandb_name}.json"
+        result_path= f"{result_path}/{exp_name}.json"
 
 
         self.trg_acc_list = []
@@ -223,6 +238,7 @@ class cross_domain_trainer(object):
         f1_best_val_list_all = []
 
         f1_list_run_all = []
+
         f1_best_list_run_all = []
 
 
@@ -246,12 +262,25 @@ class cross_domain_trainer(object):
             #assuming only 1 scenario that would be modified
             src_id = scenarios[0][0]
             trg_id = scenarios[0][1]
+            src_weight_over_run_all = []
+            trg_weight_over_run_all = []
 
+            src_weight_tot_run_all = []
+            trg_weight_tot_run_all = []
+
+            src_weight_hist_counts = np.asarray([])
+            trg_weight_hist_counts = np.asarray([])
+
+            src_weight_hist_edges = []
+            trg_weight_hist_edges = []
             print(f"Channels affected: {no_chnl_drop}")
 
             dict = {}
             loggers = {}
             f1_list_run = []
+
+
+
             f1_list_run_best_val = []
             acc_list_run = []
             f1_list_run_best = []
@@ -270,8 +299,6 @@ class cross_domain_trainer(object):
                 self.chnl_drop_list = np.random.choice(np.arange(0, self.dataset_configs.input_channels),
                                                        no_chnl_drop,replace=False)
                 trg_id_str = f"{trg_id}_no_chnl_{no_chnl_drop}"
-                wandb_val_string = f"Val_{str(src_id)}_to_{str(trg_id_str)}_run_{run_id}_{args.da_method}"
-                wandb_trn_string = f"Trn_{str(src_id)}_to_{str(trg_id_str)}_run_{run_id}_{args.da_method}"
 
 
 
@@ -306,8 +333,7 @@ class cross_domain_trainer(object):
                 loss_total = []
                 Dom_loss = []
                 Src_cls_loss = []
-                wandb.define_metric("epoch")
-                wandb.define_metric(f"*", step_metric="epoch")
+
 
                 for epoch in range(1, self.hparams["num_epochs"] + 1):  # self.hparams["num_epochs"] + 1):
                     joint_loaders = enumerate(zip(self.src_train_dl, self.trg_train_dl))
@@ -341,10 +367,9 @@ class cross_domain_trainer(object):
                             trg_x[:, self.chnl_drop_list, :] = self.satur_value
                         len_min = min(len(src_x), len(trg_x))
 
-                        if self.da_method in ["DANN", "CoDATS", "AdaMatch", "SepReps", "SepRepTranAlignEnd",
-                                              "SepAligThenAttn", "SepAligThenAttnSinkFreq", "CLUDA"]:
+                        if self.da_method in ["DANN", "CoDATS", "AdaMatch", "SepReps", "CLUDA"]:
                             losses = algorithm.update(src_x, src_y, trg_x, step, epoch, len_dataloader)
-                        elif self.da_method in {"CDAN", "MMDA", "Supervised", "SinkDiv_Alignment", "DDC", "AdvSKM",
+                        elif self.da_method in {"SSSS_TSA","CDAN", "MMDA", "Supervised", "SinkDiv_Alignment", "DDC", "AdvSKM",
                                                 "RAINCOAT", "Deep_Coral"}:
                             losses = algorithm.update(src_x, src_y, trg_x)
                         else:
@@ -353,14 +378,10 @@ class cross_domain_trainer(object):
                         for key, val in losses.items():
                             loss_avg_meters[key].update(val, src_x.size(0))
 
-                    wandb.log({f"{wandb_trn_string}/Train_TotalLoss": losses['Total_loss'], "epoch": epoch})
-                    wandb.log({f"{wandb_trn_string}/Train_SrcClfrLoss": losses['Src_cls_loss'], "epoch": epoch})
-                    wandb.log({f"{wandb_trn_string}/Train_DomLoss": losses['Domain_loss'], "epoch": epoch})
+
 
                     losses_val = self.loss_val()
-                    wandb.log({f"{wandb_val_string}/Val_TotalLoss": losses_val['Total_loss'], "epoch": epoch})
-                    wandb.log({f"{wandb_val_string}/Val_SrcClfrLoss": losses_val['Src_cls_loss'], "epoch": epoch})
-                    wandb.log({f"{wandb_val_string}/Val_DomLoss(Sink)": losses_val['Domain_loss'], "epoch": epoch})
+
 
                     # loss_total.append(losses['Total_loss'])
                     # Dom_loss.append(losses[ 'Domain_loss'])
@@ -387,23 +408,8 @@ class cross_domain_trainer(object):
                         torch.save(self.algorithm.classifier.state_dict(), f"{self.cpath}_best_val")
                     self.f1_run_score.append(f1)
 
-                    wandb.log({f"{wandb_val_string}/Val_Src_f1": f1_src, "epoch": epoch})
-                    wandb.log({f"{wandb_val_string}/Val_Trg_f1": f1, "epoch": epoch})
 
-                    # losses = algorithm.eval_update(self.src_test_dl,self.trg_test_dl)
-                    # wandb.log({f"{wandb_val_string}/Train_TotalLoss": losses['Total_loss']})
-                    # wandb.log({f"{wandb_val_string}/Train_SrcClfrLoss": losses['Src_cls_loss']})
-                    # wandb.log({f"{wandb_val_string}/Train_DomLoss": losses['Domain_loss']})
-                    # wandb.log({f"{wandb_val_string}/Val_F1": f1})
 
-                # self.algorithm = algorithm
-                # save_checkpoint(self.home_path, self.algorithm, scenarios, self.dataset_configs,
-                #                 self.scenario_log_dir, self.hparams)
-                # acc, f1,cm = self.evaluate(final=True)
-                # log = {'scenario':i,'run_id':run_id,'accuracy':acc,'f1':f1}
-                # df_a = df_a.append(log, ignore_index=True)
-
-                # fig1 = self.visualize()
                 if self.da_method == "SepReps":
                     acc, f1, cm = self.algorithm.eval(self.trg_test_dl, self.fpath, self.cpath, final=False)
                     acc_best, f1_trg_best, cm_best = self.algorithm.eval(self.trg_test_dl, self.fpath, self.cpath,
@@ -452,9 +458,18 @@ class cross_domain_trainer(object):
                 # plt.title(f"{self.da_method}..{src_id}_to_{trg_id}")
                 #
 
-                vis = 1
+                vis = 0
                 if vis:
-                   self.visualize()
+                    (greater_weights_src, total_weights_src),  (greater_weights_trg, total_weights_trg),(hist_count_src,hist_count_trg) =self.visualize()
+                    src_weight_over_run_all.append(greater_weights_src.cpu().item())
+                    trg_weight_over_run_all.append(greater_weights_trg.cpu().item())
+
+                    #src_weight_over_run_all.append(greater_weights_src)
+                    src_weight_tot_run_all.append(total_weights_src)
+                    trg_weight_tot_run_all.append(total_weights_trg)
+
+                    src_weight_hist_counts = np.concatenate((src_weight_hist_counts,hist_count_src.reshape(1,-1)),axis=0) if len(src_weight_hist_counts) else hist_count_src.reshape(1,-1)
+                    trg_weight_hist_counts = np.concatenate((trg_weight_hist_counts,hist_count_trg.reshape(1,-1)),axis=0) if len(trg_weight_hist_counts) else hist_count_trg.reshape(1,-1)
                 # plt.show()
 
                 # f1_list.append(f1)
@@ -527,6 +542,8 @@ class cross_domain_trainer(object):
 
             result_dict["method"] = self.da_method
             result_dict["dataset"] = self.dataset
+
+
             result_dict['best_val_trg_lbl'] = {}
             result_dict["end_train"] = {}
             result_dict["best_val_loss_align"] = {}
@@ -563,7 +580,7 @@ class cross_domain_trainer(object):
                 json.dump(result_dict, file, indent=4, sort_keys=False)
             print(f"Saved results in {result_path} ")
 
-        wandb.log(result_dict)
+
 
     def visualize(self):
         # set to if plot or not. Other visualizaitons only for
@@ -587,6 +604,8 @@ class cross_domain_trainer(object):
         self.src_all_features = []
         self.src_all_data = torch.from_numpy(np.asarray([]))
         self.trg_all_data = torch.from_numpy(np.asarray([]))
+        self.src_all_weights = torch.from_numpy(np.asarray([]))
+        self.trg_all_weights = torch.from_numpy(np.asarray([]))
         with torch.no_grad():
             # for data, labels in self.trg_test_dl:
             for data, labels in self.trg_test_dl:
@@ -667,34 +686,9 @@ class cross_domain_trainer(object):
                     axs2[k].set_xlim((x_min - 1, x_max + 1))
                 axs2[2].legend()
 
-            if visualize_chnl_algn and self.da_method == 'SepAligThenAttnSink':
+            if visualize_chnl_algn and self.da_method == 'SSSS_TSA':
                 'visualoize channel specific alignment, and attention scores. Made for our custom method. Fails for '
-                dist_mtx_src = np.zeros((self.algorithm.configs.num_classes, self.algorithm.configs.num_classes))
-                dist_mtx_trg = np.zeros((self.algorithm.configs.num_classes, self.algorithm.configs.num_classes))
-                dist_mtx_src_trg = np.zeros((self.algorithm.configs.num_classes, self.algorithm.configs.num_classes))
 
-                '''
-                for j in range(0,self.algorithm.configs.input_channels):
-                    src_j = torch.where(torch.from_numpy(self.src_true_labels) == j)[0]
-                    trg_j = torch.where(torch.from_numpy(self.trg_true_labels) == j)[0]
-                    for k in range(0,self.algorithm.configs.input_channels):
-                        src_k = torch.where(torch.from_numpy(self.src_true_labels) == k)[0]
-
-                        trg_k = torch.where(torch.from_numpy(self.trg_true_labels)==k)[0]
-                        min_l_j_k_src  = min(len(src_j),len(src_k))
-                        min_l_j_k_src_trg = min(len(src_j), len(trg_k))
-                        min_l_j_k_trg = min(len(trg_j), len(trg_k))
-                        numb_j_k_src = int(min_l_j_k_src /2)
-                        numb_j_k_src_trg = int(min_l_j_k_src_trg  / 2)
-                        numb_j_k_trg = int(min_l_j_k_trg/2)
-                        dist_s_s = torch.mean(torch.cdist(torch.from_numpy(self.src_all_features[src_j][0:numb_j_k_src]),torch.from_numpy(self.src_all_features[src_k][numb_j_k_src:])))
-                        dist_t_t = torch.mean(torch.cdist(torch.from_numpy(self.trg_all_features[trg_j][0: numb_j_k_trg]),torch.from_numpy(self.trg_all_features[trg_k][ numb_j_k_trg:])))
-                        dist_s_t = torch.mean(torch.cdist(torch.from_numpy(self.src_all_features[src_j][0:numb_j_k_src_trg]),
-                                                          torch.from_numpy(self.trg_all_features[trg_k][0:numb_j_k_src_trg])))
-                        dist_mtx_src[j,k] = dist_s_s
-                        dist_mtx_trg[j,k] = dist_t_t
-                        dist_mtx_src_trg[j,k] = dist_s_t
-                '''
                 preds_trg = classifier(torch.from_numpy(self.trg_all_features).to(0)).argmax(dim=1).detach().cpu()
                 preds_src = classifier(torch.from_numpy(self.src_all_features).to(0)).argmax(dim=1).detach().cpu()
                 print("Source CM")
@@ -728,55 +722,21 @@ class cross_domain_trainer(object):
                     print(cm_trg)
                 src_attn = np.asarray([])
                 trg_attn = np.asarray([])
-
                 for j in range(0, self.algorithm.configs.num_classes):
                     trg_j = torch.where(torch.from_numpy(self.trg_true_labels) == j)[0]
                     src_j = torch.where(torch.from_numpy(self.src_true_labels) == j)[0]
-                    fig, axes = plt.subplots(nrows=self.algorithm.configs.input_channels, ncols=3)
-                    # plt.figure(figsize=(24, 24))
-                    # f1_score_trg = f1_score(self.trg_true_labels[trg_j], preds_trg[trg_j], labels=[j],
-                    #                       average='binary')
-                    # f1_score_src = f1_score(self.src_true_labels[src_j], preds_src[src_j], labels=[j],
-                    #                       average='binary')
-                    plt.suptitle(
-                        f"Src(lft)  and Trg(right)  true class {j} across {self.algorithm.configs.input_channels} chnls")
-                    for k in range(0, self.algorithm.configs.input_channels):
-                        'set j to the class being interested in'
 
-                        axes[k, 0].matshow(prob_src[k][src_j, :][0:10].detach().cpu())
-                        axes[k, 0].tick_params(axis='both', which='both', bottom=False, top=False, left=False,
-                                               right=False)
-                        axes[k, 0].set_xticklabels([])
-                        axes[k, 0].set_yticklabels([])
-                        # axes[k,0].set_title(f"Src {j} Cnl {k}")
-                        axes[k, 1].matshow(prob_trg[k][trg_j, :][0:10].detach().cpu())
-                        # axes[k, 1].set_title(f"Trg {j} Cnl {k}")
-                        axes[k, 1].tick_params(axis='both', which='both', bottom=False, top=False, left=False,
-                                               right=False)
-                        axes[k, 1].set_xticklabels([])
-                        axes[k, 1].set_yticklabels([])
-                        axes[k, 2].axis('off')
+                    attn_src = self.algorithm.feature_extractor.fetch_att_weights(self.src_all_data[src_j, :, :])
+                    attn_trg = self.algorithm.feature_extractor.fetch_att_weights(self.trg_all_data[trg_j, :, :])
+                    self.src_all_weights = torch.concat((attn_src,self.src_all_weights),dim=0) if len(self.src_all_weights) else attn_src
+                    self.trg_all_weights = torch.concat((attn_trg, self.trg_all_weights), dim=0) if len(
+                        self.trg_all_weights) else attn_trg
+                greater_weights_src,total_weights_src,hist_counts_src =get_percent_selection(self.src_all_weights , self.chnl_drop_list)
+                greater_weights_trg, total_weights_trg,hist_counts_trg = get_percent_selection(self.trg_all_weights,
+                                                                                 self.chnl_drop_list)
 
-                        'get attention weights for the kth channel for the jth class'
-                    attn_src = self.algorithm.feature_extractor.fetch_att_weights(self.src_all_data[src_j, :, :])[0]
-                    attn_trg = self.algorithm.feature_extractor.fetch_att_weights(self.trg_all_data[trg_j, :, :])[0]
-                    # Adjust spacing between subplots
-
-                    src_attn = np.concatenate((src_attn, torch.diag(attn_src).cpu().reshape(1, -1)), axis=0) if len(
-                        src_attn) else torch.diag(attn_src).cpu().reshape(1, -1)
-                    trg_attn = np.concatenate((trg_attn, torch.diag(attn_trg).cpu().reshape(1, -1)), axis=0) if len(
-                        trg_attn) else torch.diag(attn_trg).cpu().reshape(1, -1)
-
-
-                    plt.tight_layout()
-                    axes[0, 2].matshow(attn_src.detach().cpu())
-                    axes[0, 2].set_title("Src Atn")
-                    axes[k, 2].matshow(attn_trg.detach().cpu())
-                    axes[k, 2].set_title("T Atn")
-                    plt.show()
-
-            print("Here. Stop to analyze channel alignment")
-
+                print("Here. Stop to analyze channel alignment")
+        return  (greater_weights_src,total_weights_src),(greater_weights_trg, total_weights_trg),(hist_counts_src,hist_counts_trg)
     def evaluate(self, final=False, best_val=False):
         feature_extractor = self.algorithm.feature_extractor.to(self.device)
         classifier = self.algorithm.classifier.to(self.device)

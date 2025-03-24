@@ -5,7 +5,7 @@ from models.loss import SinkhornDistance
 import pandas as pd
 import numpy as np
 import warnings
-import wandb
+
 import json
 import random
 import sklearn.exceptions
@@ -16,6 +16,7 @@ from sklearn.manifold import TSNE
 import umap
 warnings.filterwarnings("ignore", category=sklearn.exceptions.UndefinedMetricWarning)
 import collections
+import time
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, accuracy_score,confusion_matrix
 from dataloader.dataloader import data_generator, few_shot_data_generator, generator_percentage_of_data
@@ -81,7 +82,7 @@ class cross_domain_trainer(object):
         self.cross_entropy = nn.CrossEntropyLoss()
         self.run_description = args.run_description
         self.experiment_description = args.experiment_description
-
+        self.mean_diff_mtx = np.asarray([])
 
 
         self.best_acc = 0
@@ -114,17 +115,13 @@ class cross_domain_trainer(object):
         result_dict = {}
 
 
-        os.environ["WANDB_SILENT"] = "true"
-        os.environ['WANDB_DISABLED'] = "false"
+
         config_vars = vars(args)
         config_dataset = vars(self.dataset_configs)
         config_run = self.default_hparams
         balanced = config_dataset['balanced']
         config = config_vars
-        #config = config.update(config_run)
-        #wandb.config = omegaconf.OmegaConf.to_container(
-        #    cfg, resolve=True, throw_on_missing=True
-        #)
+
         now = datetime.now()
         dt_string = now.strftime("%d_%m_%YTime_%H:%M:%S")
 
@@ -136,8 +133,8 @@ class cross_domain_trainer(object):
 
 
 
-        wandb_name = self.da_method + '_' + self.dataset+'_'+dt_string
-        wandb.init(config=config , project="Domain_Adapt", name=wandb_name)
+        name_exp = self.da_method + '_' + self.dataset+'_'+dt_string
+
         run_name = f"{self.run_description}"
         self.hparams = self.default_hparams
         # Logging
@@ -147,7 +144,7 @@ class cross_domain_trainer(object):
         scenarios = self.dataset_configs.scenarios  # return the scenarios given a specific dataset.
         df_a = pd.DataFrame(columns=['scenario','run_id','accuracy','f1','H-score'])
 
-        result_path = f"./results/{wandb_name}.json"
+        result_path = f"./results/mean_diff/{name_exp}.json"
 
 
 
@@ -183,7 +180,7 @@ class cross_domain_trainer(object):
         cm_list = []
         scenario_list =[]
 
-
+        pairwise_all_dist = []
         for i in scenarios:
             src_id = i[0]
             trg_id = i[1]
@@ -195,13 +192,9 @@ class cross_domain_trainer(object):
             f1_list_run_best = []
             acc_list_run_best = []
             acc_list_run_best_val = []
+            pairwise_dist_list = []
             for run_id in range(0,self.num_runs):
-                # specify number of consecutive runs
-                # fixing random seed
-                #run_id = 2025
-                #run_id = 8
-                wandb_val_string = f"Val_{str(src_id)}_to_{str(trg_id)}_run_{run_id}_{args.da_method}"
-                wandb_trn_string = f"Trn_{str(src_id)}_to_{str(trg_id)}_run_{run_id}_{args.da_method}"
+
 
                 self.f1_run_score =[]
                 torch.cuda.empty_cache()
@@ -209,16 +202,34 @@ class cross_domain_trainer(object):
 
                 # Logging
                 self.logger, self.scenario_log_dir = starting_logs(self.dataset, self.da_method, self.exp_log_dir,
-                                                                   src_id, trg_id, run_id)
+                                                                  src_id, trg_id, run_id)
+
                 self.fpath = os.path.join(self.home_path, self.scenario_log_dir, 'backbone.pth')
                 self.cpath = os.path.join(self.home_path, self.scenario_log_dir, 'classifier.pth')
+                if hasattr(args, "sink_eps"):
+                    self.fpath = os.path.join(self.home_path, self.scenario_log_dir, f"eps_{args.sink_eps}_backbone.pth")
+                    self.cpath = os.path.join(self.home_path, self.scenario_log_dir,  f"eps_{args.sink_eps}_classifier.pth")
+
+                    if hasattr(args, "tau_temp"):
+                        self.fpath = os.path.join(self.home_path, self.scenario_log_dir,
+                                                  f"eps_{args.sink_eps}_tau_{args.tau_temp}_backbone.pth")
+                        self.cpath = os.path.join(self.home_path, self.scenario_log_dir,
+                                                  f"eps_{args.sink_eps}_tau_{args.tau_temp}_classifier.pth")
                 self.best_acc = 0
                 self.best_val_loss = 1e10
                 # Load data
                 self.load_data(src_id, trg_id)
                 
                 # get algorithm
-                
+                if hasattr(args, "sink_eps"):
+                    self.hparams['sink_epsilon'] =args.sink_eps
+                    result_path =  f"./results/mean_diff/{name_exp}_eps_{args.sink_eps}.json"
+
+                    if hasattr(args, "tau_temp"):
+                        self.hparams['tau_temp'] = args.tau_temp
+
+                #if hasattr(args, "tau_temp"):
+                #    self.dataset_configs['sink_epsilon'] =args.sink_eps
                 backbone_fe = get_backbone_class(self.backbone)
                 if self.da_method == 'RAINCOAT':
                     algorithm = RAINCOAT(self.dataset_configs, self.hparams, self.device)
@@ -228,25 +239,30 @@ class cross_domain_trainer(object):
                 algorithm.to(self.device)
                 self.algorithm = algorithm
                 # Average meters
+
+                if args.load:
+                    feature_extractor = self.algorithm.feature_extractor.to(self.device)
+                    classifier = self.algorithm.classifier.to(self.device)
+
+                    classifier.load_state_dict(torch.load(self.cpath))
+                    feature_extractor.load_state_dict(torch.load(self.fpath))
                 loss_avg_meters = collections.defaultdict(lambda: AverageMeter())
 
                 # training..
-                #self.eval()
-                loss_total = []
-                Dom_loss = []
-                Src_cls_loss = []
-                wandb.define_metric("epoch")
-                wandb.define_metric(f"*", step_metric="epoch")
 
-                for epoch in range(1,self.hparams["num_epochs"] + 1):# self.hparams["num_epochs"] + 1):
+
+                for epoch in range(1,self.hparams["num_epochs"] + 1):
+                   # self.hparams["num_epochs"] + 1):
                     joint_loaders = enumerate(zip(self.src_train_dl, self.trg_train_dl))
                     len_dataloader = min(len(self.src_train_dl), len(self.trg_train_dl))
                     algorithm.train()
 
                     for step, ((src_x, src_y), (trg_x, trg_y)) in joint_loaders:
+                        s_epoch_time = time.time()
                         src_x, src_y, trg_x,trg_y = src_x.float().to(self.device), src_y.long().to(self.device), \
                                               trg_x.float().to(self.device), trg_y.to(self.device)
 
+                        config['plot_input_sig'] = 0
                         if config['plot_input_sig']:
                             plot_input(src_x,trg_x,src_y,trg_y,self.dataset,src_id=src_id, trg_id=trg_id)
                             plt.show()
@@ -261,27 +277,23 @@ class cross_domain_trainer(object):
 
                         len_min = min(len(src_x), len(trg_x))
 
-                        if self.da_method in ["DANN", "CoDATS", "AdaMatch","SepReps","SepRepTranAlignEnd","SepAligThenAttn","SepAligThenAttnSinkFreq","CLUDA"]:
+                        if self.da_method in ["DANN", "CoDATS", "AdaMatch","CLUDA"]:
                             losses = algorithm.update(src_x, src_y, trg_x,  step, epoch, len_dataloader)
-                        elif self.da_method in {"CDAN","MMDA","Supervised","SinkDiv_Alignment","DDC","AdvSKM","RAINCOAT","Deep_Coral"}:
+                        elif self.da_method in {"SSSS_TSA","CDAN","MMDA","Supervised","SinkDiv_Alignment","DDC","AdvSKM","RAINCOAT","Deep_Coral","SASA","JDOT","CoTMix","TestTime_adapt"}:
                             losses = algorithm.update(src_x, src_y, trg_x)
                         else:
                             losses = algorithm.update(src_x, src_y, trg_x,trg_y,step,epoch,len_dataloader)
-
+                        epoch_en = time.time()
+                        #print("here")
                         for key, val in losses.items():
                             loss_avg_meters[key].update(val, src_x.size(0))
 
 
-                    wandb.log({f"{wandb_trn_string}/Train_TotalLoss": losses['Total_loss'],"epoch":epoch})
-                    wandb.log({f"{wandb_trn_string}/Train_SrcClfrLoss": losses['Src_cls_loss'],"epoch":epoch})
-                    wandb.log({f"{wandb_trn_string}/Train_DomLoss": losses['Domain_loss'],"epoch":epoch})
 
 
 
                     losses_val = self.loss_val()
-                    wandb.log({f"{wandb_val_string}/Val_TotalLoss": losses_val['Total_loss'], "epoch": epoch})
-                    wandb.log({f"{wandb_val_string}/Val_SrcClfrLoss": losses_val['Src_cls_loss'], "epoch": epoch})
-                    wandb.log({f"{wandb_val_string}/Val_DomLoss(Sink)": losses_val['Domain_loss'], "epoch": epoch})
+
 
 
 
@@ -297,6 +309,7 @@ class cross_domain_trainer(object):
 
                     elif self.da_method =="SepReps":
                         acc, f1,cm = self.algorithm.eval(self.trg_test_dl)
+
                     else:
 
                         (acc, f1, cm),(acc_src, f1_src, cm_src) = self.evaluate()
@@ -311,14 +324,6 @@ class cross_domain_trainer(object):
                         torch.save(self.algorithm.classifier.state_dict(), f"{self.cpath}_best_val")
                     self.f1_run_score.append(f1)
 
-                    wandb.log({f"{wandb_val_string}/Val_Src_f1": f1_src ,"epoch": epoch})
-                    wandb.log({f"{wandb_val_string}/Val_Trg_f1": f1, "epoch": epoch})
-
-                    #losses = algorithm.eval_update(self.src_test_dl,self.trg_test_dl)
-                    #wandb.log({f"{wandb_val_string}/Train_TotalLoss": losses['Total_loss']})
-                    #wandb.log({f"{wandb_val_string}/Train_SrcClfrLoss": losses['Src_cls_loss']})
-                    #wandb.log({f"{wandb_val_string}/Train_DomLoss": losses['Domain_loss']})
-                    #wandb.log({f"{wandb_val_string}/Val_F1": f1})
 
                 # self.algorithm = algorithm
                 # save_checkpoint(self.home_path, self.algorithm, scenarios, self.dataset_configs,
@@ -356,15 +361,34 @@ class cross_domain_trainer(object):
                         (acc_best, f1_trg_best, cm_best), (acc_src, f1_src_best, cm_src)= self.eval(final=True)
                         (acc_best_val, f1_best_val, cm_best_val),(acc_src_best_val, f1_src_best_val, cm_src_best_val) = self.eval(best_val=True)
                         #cm = cms[0]
+                elif self.da_method == "TestTime_adapt":
+                    acc, f1 = self.algorithm.evaluate(self.src_train_dl, self.trg_test_dl)
+                    f1_trg_best = f1
+                    acc_trg_best = acc
+                    f1_trg_best_val = f1
+                    acc_trg_best_val = acc
+                    acc_best = acc
+                    f1_trg_best = f1
+                    cm_best = 0
+                    cm_src = 0
+                    f1_src = f1
+                    acc_src = acc
+                    cm_best = 0
+                    acc_best_val = acc
+                    f1_best_val = f1
+                    cm_src = 0
                 else:
                     (acc, f1, cm),(acc_src, f1_src, cm_src) = self.evaluate(final_end=True)
 
                     (acc_best, f1_trg_best, cm_best), (acc_src, f1_src_best, cm_src) = self.evaluate(final=True)
                     (acc_best_val, f1_best_val, cm_best_val), (acc_src_best_val, f1_src_best_val, cm_src_best_val) = self.evaluate(best_val=True)
+                    pairwise_dist = self.get_pariwise_dist()
+
+                pairwise_dist_list.append(pairwise_dist)
                 f1_list_run.append(f1)
                 f1_list_run_best.append(f1_trg_best)
                 f1_list_run_best_val.append(f1_best_val)
-                cm_list.append(cm)
+                #cm_list.append(cm)
 
                 acc_list_run.append(acc)
                 acc_list_run_best.append(acc_best)
@@ -372,20 +396,15 @@ class cross_domain_trainer(object):
 
                 #plt.plot(self.f1_run_score)
                 #plt.title(f"{self.da_method}..{src_id}_to_{trg_id}")
+                torch.save(self.algorithm.feature_extractor.state_dict(), self.fpath)
+                torch.save(self.algorithm.classifier.state_dict(), self.cpath)
                 vis = 0
                 if vis:
                     self.visualize()
-                #plt.show()
-
-
-                #f1_list.append(f1)
-                #log = {'scenario':i,'run_id':run_id,'accuracy':acc,'f1':f1}
-                #df_a = df_a.append(log, ignore_index=True)
-                #print("visualization after correction")
 
             f1_list.append(np.mean(f1_list_run))
             f1_list_std.append(np.std(f1_list_run))
-
+            pairwise_all_dist.append(pairwise_dist_list)
 
             acc_list.append(np.mean(acc_list_run))
             acc_list_std.append(np.std(acc_list_run))
@@ -406,8 +425,6 @@ class cross_domain_trainer(object):
             f1_list_all.append(f1_list_run)
 
             scenario_list.append(f"{src_id} to {trg_id}")
-        #mean_acc, std_acc, mean_f1, std_f1 = self.avg_result(df_a,'average_align.csv')
-            #print("\n\n End of training results (no trgt labels to stop)")
 
 
 
@@ -451,11 +468,7 @@ class cross_domain_trainer(object):
             for i in range(0, len(acc_best_list)):
                 print(f"{acc_best_list[i]}")
 
-            #log = {'scenario':mean_acc,'run_id':std_acc,'accuracy':mean_f1,'f1':std_f1}
-            #df_a = df_a.append(log, ignore_index=True)
-            #print(df_a)
-            #path =  os.path.join(self.exp_log_dir, 'average_align.csv')
-            #df_a.to_csv(path,sep = ',')
+
             print(f1_best_list)
             print(acc_best_list)
 
@@ -491,20 +504,27 @@ class cross_domain_trainer(object):
             result_dict['best_val_loss_align']['acc_mean'] = np.mean(acc_best_val_list)
             result_dict['best_val_loss_align']['acc_mean_std'] = np.mean(acc_best_val_list_std)
             result_dict['best_val_loss_align']['result List acc'] = acc_best_val_list
-
+            result_dict['pairwise_dist_list'] = pairwise_all_dist
             with open(result_path, "w") as file:
                 # Use json.dump() to write JSON data with formatting
                 json.dump(result_dict, file, indent=4, sort_keys=False)
             print(f"Saved results in {result_path} ")
 
-        wandb.log(result_dict)
 
 
-
+    def compute_mean_per_class_per_channel(self,data_mtrx,labels):
+        no_classes = len(np.unique(labels))
+        no_channels = 3
+        mtrx = np.zeros((no_channels,no_classes))
+        for i in range(0,no_channels):
+            for k in range(0,no_classes):
+                lbl_idx = np.where(labels == k)[0]
+                mtrx[i,k] = torch.mean(torch.mean(data_mtrx[lbl_idx,i,:],dim=-1))
+        return mtrx
     def visualize(self):
         #set to if plot or not. Other visualizaitons only for
         plot = 0
-        visualize_chnl_algn = 1
+        visualize_chnl_algn = 0
 
 
         reducer = umap.UMAP()
@@ -512,8 +532,7 @@ class cross_domain_trainer(object):
         classifier = self.algorithm.classifier.to(self.device)
 
 
-        #classifier.load_state_dict(torch.load(self.cpath))
-        #feature_extractor.load_state_dict(torch.load(self.fpath))
+
         feature_extractor.eval()
         classifier.eval()
 
@@ -529,6 +548,7 @@ class cross_domain_trainer(object):
             # for data, labels in self.trg_test_dl:
             for data, labels in self.trg_test_dl:
                 data = data.float().to(self.device)
+
                 self.trg_all_data = torch.concat((self.trg_all_data, data), dim=0) if len(self.trg_all_data) else data
                 labels = labels.view((-1)).long().to(self.device)
                 features = feature_extractor(data)
@@ -538,13 +558,17 @@ class cross_domain_trainer(object):
             
             for data, labels in self.src_test_dl:
                 data = data.float().to(self.device)
-
+                data  = (data - torch.mean(data, dim=-1).unsqueeze(-1)) / (torch.std(data, dim=-1)).unsqueeze(-1)
                 self.src_all_data = torch.concat((self.src_all_data, data), dim=0) if len(self.src_all_data) else data
                 labels = labels.view((-1)).long().to(self.device)
-                #features = feature_extractor(data)[0]
+
                 features = feature_extractor(data)
                 self.src_all_features.append(features.cpu().numpy())
                 self.src_true_labels = np.append(self.src_true_labels, labels.data.cpu().numpy())
+            src_mean_mtx = self.compute_mean_per_class_per_channel(self.src_all_data,self.src_true_labels)
+            trg_mean_mtx = self.compute_mean_per_class_per_channel(self.trg_all_data,self.trg_true_labels)
+            diff_src_trg = np.abs(src_mean_mtx - trg_mean_mtx)
+            self.mean_diff_mtx = np.concatenate((self.mean_diff_mtx,diff_src_trg.reshape(1,3,-1))) if len(self.mean_diff_mtx) else diff_src_trg.reshape(1,3,-1)
             self.src_all_features = np.vstack(self.src_all_features)
             self.trg_all_features = np.vstack(self.trg_all_features)
             #dr, Cx, Cy = self.LOT(torch.from_numpy(self.src_all_features).to(self.device), torch.from_numpy(self.trg_all_features).to(self.device))
@@ -575,7 +599,7 @@ class cross_domain_trainer(object):
                                     alpha=0.6)
                 for j in range(0, self.algorithm.configs.num_classes):
                     j_idx = np.where((labels== j)& (src_trgt_lbl == 1)  )[0]
-                    axs2[2].scatter(transformed_data[j_idx, 0], transformed_data[j_idx, 1], c=clr_list[j], label=label_list[j],
+                    axs2[2].scatter(transformed_data[j_idx, 0], transformed_data[j_idx, 1], c=clr_list[j], label=label_list[j],marker='x',
                                     alpha=0.6)
 
                 x_min =  min(np.concatenate((transformed_data[:, 0], transformed_data[:, 0])))
@@ -592,35 +616,9 @@ class cross_domain_trainer(object):
                     axs2[k].set_xlim((x_min-1,x_max+1))
                 axs2[2].legend()
                 plt.tight_layout()
+                plt.savefig('figures/example_1/good.pdf')
+            if visualize_chnl_algn and self.da_method == 'SSSS_TSA' or  self.da_method == 'SepAligThenAttnSinkFreq' :
 
-            if visualize_chnl_algn and self.da_method == 'SepAligThenAttnSink' or  self.da_method == 'SepAligThenAttnSinkFreq' :
-                'visualoize channel specific alignment, and attention scores. Made for our custom method. Fails for '
-                dist_mtx_src = np.zeros((self.algorithm.configs.num_classes,self.algorithm.configs.num_classes))
-                dist_mtx_trg = np.zeros((self.algorithm.configs.num_classes,self.algorithm.configs.num_classes))
-                dist_mtx_src_trg =np.zeros((self.algorithm.configs.num_classes,self.algorithm.configs.num_classes))
-
-                '''
-                for j in range(0,self.algorithm.configs.input_channels):
-                    src_j = torch.where(torch.from_numpy(self.src_true_labels) == j)[0]
-                    trg_j = torch.where(torch.from_numpy(self.trg_true_labels) == j)[0]
-                    for k in range(0,self.algorithm.configs.input_channels):
-                        src_k = torch.where(torch.from_numpy(self.src_true_labels) == k)[0]
-
-                        trg_k = torch.where(torch.from_numpy(self.trg_true_labels)==k)[0]
-                        min_l_j_k_src  = min(len(src_j),len(src_k))
-                        min_l_j_k_src_trg = min(len(src_j), len(trg_k))
-                        min_l_j_k_trg = min(len(trg_j), len(trg_k))
-                        numb_j_k_src = int(min_l_j_k_src /2)
-                        numb_j_k_src_trg = int(min_l_j_k_src_trg  / 2)
-                        numb_j_k_trg = int(min_l_j_k_trg/2)
-                        dist_s_s = torch.mean(torch.cdist(torch.from_numpy(self.src_all_features[src_j][0:numb_j_k_src]),torch.from_numpy(self.src_all_features[src_k][numb_j_k_src:])))
-                        dist_t_t = torch.mean(torch.cdist(torch.from_numpy(self.trg_all_features[trg_j][0: numb_j_k_trg]),torch.from_numpy(self.trg_all_features[trg_k][ numb_j_k_trg:])))
-                        dist_s_t = torch.mean(torch.cdist(torch.from_numpy(self.src_all_features[src_j][0:numb_j_k_src_trg]),
-                                                          torch.from_numpy(self.trg_all_features[trg_k][0:numb_j_k_src_trg])))
-                        dist_mtx_src[j,k] = dist_s_s
-                        dist_mtx_trg[j,k] = dist_t_t
-                        dist_mtx_src_trg[j,k] = dist_s_t
-                '''
                 preds_trg = classifier(torch.from_numpy(self.trg_all_features).to(0)).argmax(dim=1).detach().cpu()
                 preds_src = classifier(torch.from_numpy(self.src_all_features).to(0)).argmax(dim=1).detach().cpu()
                 print("Source CM")
@@ -642,7 +640,7 @@ class cross_domain_trainer(object):
                 f1_list_chnl_trg = []
 
 
-                if self.da_method == 'SepAligThenAttnSink':
+                if self.da_method == 'SSSS_TSA' or self.da_method == 'SepAligSameEncThenAttnSink':
                     no_channels = self.algorithm.configs.input_channels
                 elif self.da_method == 'SepAligThenAttnSinkFreq':
                     no_channels = self.algorithm.configs.input_channels *2
@@ -704,9 +702,9 @@ class cross_domain_trainer(object):
                     axes[0,2].set_title("Src Atn")
                     axes[k, 2].matshow(attn_trg)
                     axes[k, 2].set_title("T Atn")
-                    #plt.show()
 
-            #np.savez("figures/HHAR_0_2/data_for_plots/attn.npz", src=src_attn, trg=trg_attn)
+
+
             print("Here. Stop to analyze channel alignment")
     
     def evaluate(self, final_end = False,final=False,best_val=False):
@@ -741,7 +739,7 @@ class cross_domain_trainer(object):
         with torch.no_grad():
             for data, labels in dloader:
                 data = data.float().to(self.device)
-
+                #data = (data - torch.mean(data, dim=-1).unsqueeze(-1)) / (torch.std(data, dim=-1)).unsqueeze(-1)
                 labels = labels.view((-1)).long().to(self.device)
 
                 # forward pass
@@ -775,7 +773,7 @@ class cross_domain_trainer(object):
         with torch.no_grad():
             for data, labels in dloader:
                 data = data.float().to(self.device)
-
+                #data = (data - torch.mean(data, dim=-1).unsqueeze(-1)) / (torch.std(data, dim=-1)).unsqueeze(-1)
                 labels = labels.view((-1)).long().to(self.device)
 
                 # forward pass
@@ -867,6 +865,51 @@ class cross_domain_trainer(object):
 
         return (accuracy*100, f1,confusion_matrix_trgt),(accuracy_src,f1_src,confusion_matrix_src)
 
+    def get_pariwise_dist(self, final_end=False, final=False, best_val=False):
+        pairwise_dist = 0
+
+        # self.algorithm.ema.apply_shadow()
+        # # evaluate
+        # self.algorithm.ema.restore()
+
+
+        src_x_array = np.array([])
+        trg_x_array  = np.array([])
+        src_y_array = np.array([])
+        trg_y_array = np.array([])
+        self.trg_x_feats = torch.from_numpy(np.array([]))
+        with torch.no_grad():
+            joint_loaders = enumerate(zip(self.src_train_dl, self.trg_train_dl))
+            for step, ((src_x, src_y), (trg_x, trg_y)) in joint_loaders:
+                #print("here")
+                src_x = src_x.numpy()
+                trg_x = trg_x.numpy()
+                src_y = src_y.numpy()
+                trg_y = trg_y.numpy()
+                src_x_array = np.concatenate((src_x_array,src_x),axis=0) if len(src_x_array) else src_x
+                trg_x_array = np.concatenate((trg_x_array, trg_x), axis=0) if len(trg_x_array) else trg_x
+                src_y_array = np.concatenate((src_y_array, src_y), axis=0) if len(src_y_array) else src_y
+                trg_y_array = np.concatenate((trg_y_array, trg_y), axis=0) if len(trg_y_array) else trg_y
+            #print("here")
+        no_unique_src = np.unique(src_y_array)
+        no_unique_trg = np.unique(trg_y_array)
+        idx_label_list = []
+        mean_array_src = []
+        for k in range(0,len(no_unique_src)):
+            label = no_unique_src[k]
+            idx_lbl = np.where(src_y_array==label)[0]
+            mean_array_src.append(np.mean(np.mean(src_x_array[idx_lbl,:,:],axis=-1),axis=0))
+
+        mean_array_trg = []
+        pairwise_mean_diff = []
+        for k in range(0, len(no_unique_trg)):
+            label = no_unique_trg[k]
+            idx_lbl = np.where(trg_y_array == label)[0]
+            mean_array_trg.append(np.mean(np.mean(trg_x_array[idx_lbl, :, :], axis=-1), axis=0))
+        if len(mean_array_src) == len(mean_array_trg):
+            for k in range(0,len(mean_array_src)):
+                pairwise_mean_diff.append(np.abs(mean_array_src[k] -mean_array_trg[k] ).tolist())
+        return pairwise_mean_diff
     def get_configs(self):
         dataset_class = get_dataset_class(self.dataset)
         hparams_class = get_hparams_class(self.dataset)

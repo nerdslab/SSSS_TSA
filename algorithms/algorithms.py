@@ -2,18 +2,53 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
+import time
+
+
+from torch.profiler import profile, record_function, ProfilerActivity
 import matplotlib.pyplot as plt
 #from .RAINCOAT import CNN
 import torch.nn.functional as F
+import torch.distributions as dist
 from models.models import classifier, ReverseLayerF, Discriminator, RandomLayer, Discriminator_CDAN, \
     codats_classifier, AdvSKM_Disc, SepReps_with_multihead,SepReps,AttnCombMultihead,SepReps_with_multihead_with_freq,\
-    simple_average_feed_forward, SepReps_with_sum,CLUDA_NN
-from models.loss import MMD_loss, CORAL, ConditionalEntropyLoss, VAT, LMMD_loss, HoMM_loss
+    simple_average_feed_forward, SepReps_with_sum,CLUDA_NN, CNN_ATTN,SepRepsComEnc_with_multihead
+from models.loss import MMD_loss, CORAL, ConditionalEntropyLoss, VAT, LMMD_loss, HoMM_loss,KLDiv
+#from algorithms.losses import NTXentLoss
+#from algorithms.losses import SupConLoss as SupConLoss2
 from models.augmentations import jitter, scaling, permutation
 from torch.optim import SGD
-from models.loss import SinkhornDistance,LOT,SupConLoss,SimCLR_Loss
+from models.loss import SinkhornDistance,LOT,SupConLoss,SimCLR_Loss,SinkhornDistance_custom
 from sklearn.metrics import f1_score,accuracy_score,confusion_matrix
 from CLUDA_main.utils.augmentations import Augmenter, concat_mask
+
+
+def kl_divergence_embeddings(embeddings1, embeddings2):
+  """Computes the KL divergence between two sets of embeddings.
+
+  Args:
+    embeddings1: The first set of embeddings.
+    embeddings2: The second set of embeddings.
+
+  Returns:
+    The KL divergence between the two Gaussian distributions fitted to the embeddings.
+  """
+
+  # Fit Gaussian distributions
+  mu1 = embeddings1.mean(dim=0)
+  #cov1 = torch.cov(embeddings1.T)
+  cov1 = torch.eye(embeddings1.shape[-1]).to(embeddings1.device)
+  dist1 = dist.MultivariateNormal(loc=mu1, covariance_matrix=cov1)
+
+  mu2 = embeddings2.mean(dim=0)
+  #cov2 = torch.cov(embeddings2.T)
+  cov2 = torch.eye(embeddings1.shape[-1]).to(embeddings1.device)
+  dist2 = dist.MultivariateNormal(loc=mu2, covariance_matrix=cov2)
+
+  # Compute KL divergence
+  kl_div = dist.kl_divergence(dist1, dist2)
+  return kl_div
+
 def get_algorithm_class(algorithm_name):
     """Return the algorithm class with the given name."""
     if algorithm_name not in globals():
@@ -827,16 +862,17 @@ class SinkDiv_Alignment(Algorithm):
         domain_loss = self.sink(src_feat, trg_feat)[0]
         #cond_ent_loss = self.cond_ent(trg_feat)
         loss_domain = domain_loss
-        loss_domain.backward(retain_graph=True)
+        #loss_domain.backward(retain_graph=True)
 
         src_pred = self.classifier(src_feat)
 
         src_cls_loss = self.cross_entropy(src_pred, src_y)
-        loss_sup =src_cls_loss # self.hparams["src_cls_loss_wt"]* src_cls_loss #1*self.hparams['sinkdiv_loss_wt']*domain_loss
+        loss_sup =src_cls_loss * self.hparams["src_cls_loss_wt"]* src_cls_loss + 1*self.hparams['sinkdiv_loss_wt']*domain_loss
 
+        #loss = loss_domain + src_cls_loss
 
-
-        loss_sup.backward(retain_graph=True)
+        #loss_sup.backward(retain_graph=True)
+        loss_sup.backward()
         self.optimizer.step()
         #domain_loss.detach()
         return {'Total_loss': loss_sup.item()+domain_loss.item(), 'Src_cls_loss': src_cls_loss.item(),'Domain_loss':domain_loss.item()}
@@ -901,6 +937,7 @@ class DANN(Algorithm):
         #self.ema.register()
         
     def update(self, src_x, src_y, trg_x, step, epoch, len_dataloader,val=False):
+        ep_s = time.time()
         p = float(step + epoch * len_dataloader) / self.hparams["num_epochs"] + 1 / len_dataloader
         alpha = 2. / (1. + np.exp(-10 * p)) - 1
 
@@ -911,12 +948,27 @@ class DANN(Algorithm):
         domain_label_src = torch.ones(len(src_x)).to(self.device)
         domain_label_trg = torch.zeros(len(trg_x)).to(self.device)
 
-        src_feat = self.feature_extractor(src_x)
+
+
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif torch.xpu.is_available():
+            device = 'xpu'
+
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        sort_by_keyword = device + "_time_total"
+        with profile(activities=activities, record_shapes=True) as prof:
+            with record_function("model_inference"):
+                #model(inputs)
+                src_feat = self.feature_extractor(src_x)
+
+
+        # Task classification  Loss
+        #print(prof.key_averages().table(sort_by=sort_by_keyword, row_limit=10))
         src_pred = self.classifier(src_feat)
 
         trg_feat = self.feature_extractor(trg_x)
-
-        # Task classification  Loss
+        t_2 = time.time()
         src_cls_loss = self.cross_entropy(src_pred.squeeze(), src_y)
 
         # Domain classification loss
@@ -940,6 +992,7 @@ class DANN(Algorithm):
         self.optimizer.step()
         self.optimizer_disc.step()
         # self.ema.update()
+        ep_end = time.time()
         return {'Total_loss': loss.item(), 'Domain_loss': domain_loss.item(), 'Src_cls_loss': src_cls_loss.item()}
 
     def eval_update(self, src,trg):
@@ -1816,13 +1869,208 @@ class SepAligThenAttn(Algorithm):
 
 
 
-class SepAligThenAttnSink(Algorithm):
+class SSSS_TSA(Algorithm):
+    """
+    method for the proposed SSSS_TSA algorithm
+    Separate representations for each chanell. Multihead attention to combine them. Loss applied on combined term
+    """
+
+    def __init__(self, backbone_fe, configs, hparams, device):
+        super(SSSS_TSA, self).__init__(configs)
+        true_final_out_channels = configs.true_final_out_channels
+        configs.final_out_channels = true_final_out_channels
+        self.true_input_channel = configs.input_channels
+
+        if 'tau_temp'in hparams:
+            configs.temp = hparams['tau_temp']
+
+        self.feature_extractor = SepReps_with_multihead(configs,backbone_fe)
+
+
+        self.classifier_list_ind = nn.ModuleList([])
+        self.domain_classifier_list_ind = nn.ModuleList([])
+        for k in range(0,self.true_input_channel):
+            self.classifier_list_ind.append(classifier(configs))
+
+
+        self.optimizer_ind = torch.optim.Adam(
+            list(self.feature_extractor.backbone_nets.parameters())  +\
+       list(self.classifier_list_ind.parameters()),
+            lr=1 * hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"], betas=(0.5, 0.99))
+
+
+
+        configs.input_channels = self.true_input_channel
+        configs.final_out_channels = true_final_out_channels * self.true_input_channel
+
+        self.classifier = classifier(configs)
+
+        self.optimizer_comb = torch.optim.Adam(list(self.feature_extractor.backbone_nets.parameters())  +\
+       list(self.classifier_list_ind.parameters()) +list(self.feature_extractor.multihead_attention.parameters())+
+                                               list(self.classifier.parameters()),lr=1 * hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"], betas=(0.5, 0.99))
+
+        self.hparams = hparams
+        self.feature_extractor.to(device)
+
+        self.classifier.to(device)
+
+        self.classifier_list_ind.to(device)
+
+        self.device = device
+
+        if 'sink_epsilon' in hparams:
+            self.sink_eps = hparams['sink_epsilon']
+        else:
+            self.sink_eps = 1e-3
+
+
+        self.sink = SinkhornDistance(self.sink_eps, max_iter=1000, reduction='sum')
+
+
+    def update(self, src_x, src_y, trg_x):
+
+        self.optimizer_comb.zero_grad()
+
+
+
+        src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(src_x)
+
+        clfr_src_list = 0
+
+
+        for k in range(0,self.true_input_channel):
+            clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+            clfr_src_list = clfr_src_list + (self.cross_entropy( clfr_k_pred.squeeze(), src_y))
+
+        # Align target and channel represenations for each channel
+
+        trg_reps_list_chnl = self.feature_extractor.fetch_individual_reps(trg_x)
+        align_loss = 0
+
+        for k in range(0, self.true_input_channel):
+
+
+            align_loss_k =  self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])[0]
+
+            align_loss = align_loss + align_loss_k
+
+
+
+
+
+        #Loss for individual channels
+
+        domain_loss_ind = 1*torch.sum(align_loss  )
+        loss_ind = self.hparams["src_cls_loss_wt"] * torch.sum(clfr_src_list) + \
+              1* self.hparams["domain_loss_wt"] * domain_loss_ind
+
+
+        #Pass indivual channel represenations through Channel selection layer to get combined channel representations
+
+        comb_reps_src,src_comb_attn = self.feature_extractor.combine_ind_through_attn(src_reps_list_chnl)
+
+        clfr_pred_comb = self.classifier(comb_reps_src)
+        loss_sup_src = self.cross_entropy(clfr_pred_comb.squeeze(),src_y)
+
+
+
+        comb_reps_trg,trg_comb_attn  = self.feature_extractor.combine_ind_through_attn(trg_reps_list_chnl)
+
+
+        domain_loss = self.sink(comb_reps_src,comb_reps_trg)[0]# +self.sink(comb_reps_src,comb_reps_trg)[0]
+
+
+
+        loss_comb = 1*(self.hparams["src_cls_loss_wt"] * loss_sup_src + \
+                   self.hparams["domain_loss_wt"]*1 * domain_loss) + 1*loss_ind
+
+
+        loss_comb.backward()
+
+        self.optimizer_comb.step()
+
+        loss_comb_total = loss_comb.item()
+
+
+        return {'Total_loss': loss_comb_total,'Src_cls_loss':loss_sup_src.item(),'Domain_loss':domain_loss.item()}
+
+
+    def get_ind_scores(self,x):
+        #self.feature_extractor.eval()
+        #self.classifier_list_ind.eval()
+
+        pred_prob_list =[]
+        pred_list =[]
+        with torch.no_grad():
+            src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(x)
+            for k in range(0, self.true_input_channel):
+                pred_prob_list.append(self.classifier_list_ind[k](src_reps_list_chnl[k]).detach().cpu())
+                pred_list.append(self.classifier_list_ind[k](src_reps_list_chnl[k]).argmax(dim=1).detach().cpu())
+        return pred_prob_list,pred_list
+
+
+    def eval_update(self, src,trg):
+        joint_loaders = enumerate(zip(src, trg))
+        len_dataloader = min(len(src), len(trg))
+        src_loss_list = []
+        dom_loss_list = []
+        tloss_list = []
+        with torch.no_grad():
+            for step, ((src_x, src_y), (trg_x, trg_y)) in joint_loaders:
+                src_x, src_y, trg_x, trg_y = src_x.float().to(self.device), src_y.long().to(self.device), \
+                                             trg_x.float().to(self.device), trg_y.to(self.device)
+
+
+
+                domain_label_src = torch.ones(len(src_x)).to(self.device)
+                domain_label_trg = torch.zeros(len(trg_x)).to(self.device)
+
+                src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(src_x)
+
+                clfr_src_list = 0
+                for k in range(0, self.true_input_channel):
+                    clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+                    clfr_src_list = clfr_src_list + (self.cross_entropy(clfr_k_pred.squeeze(), src_y))
+                trg_reps_list_chnl = self.feature_extractor.fetch_individual_reps(trg_x)
+                align_loss = 0
+                for k in range(0, self.true_input_channel):
+                    align_loss_k = self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])
+
+                    align_loss = align_loss + align_loss_k[0]
+
+                domain_loss_ind = torch.sum(clfr_src_list) + torch.sum(align_loss)
+                loss_ind = self.hparams["src_cls_loss_wt"] * torch.sum(clfr_src_list) + \
+                           self.hparams["domain_loss_wt"] * domain_loss_ind
+
+
+                comb_reps_src = self.feature_extractor.combine_ind_through_attn(src_reps_list_chnl)
+                clfr_pred_comb = self.classifier(comb_reps_src)
+                loss_sup_src = self.cross_entropy(clfr_pred_comb.squeeze(), src_y)
+
+                comb_reps_trg = self.feature_extractor.combine_ind_through_attn(trg_reps_list_chnl)
+
+                domain_loss = self.sink(comb_reps_src, comb_reps_trg)[0]
+
+                loss_comb = self.hparams["src_cls_loss_wt"] * loss_sup_src + \
+                            self.hparams["domain_loss_wt"] * domain_loss + 0.3*loss_ind
+
+                dom_loss_list.append(domain_loss.item())
+                src_loss_list.append(loss_sup_src.item())
+                tloss_list.append(loss_comb.item())
+
+        # self.ema.update()
+        return {'Total_loss': np.mean(tloss_list), 'Src_cls_loss':np.mean(src_loss_list), 'Domain_loss': np.mean(dom_loss_list)}
+
+
+class SepAligThenAttnMMD(Algorithm):
     """
     Separate representations for each chanell. Multihead attention to combine them. Loss applied on combined term
     """
 
     def __init__(self, backbone_fe, configs, hparams, device):
-        super(SepAligThenAttnSink, self).__init__(configs)
+        super(SepAligThenAttnMMD, self).__init__(configs)
         true_final_out_channels = configs.true_final_out_channels
         configs.final_out_channels = true_final_out_channels
         self.true_input_channel = configs.input_channels
@@ -1863,11 +2111,13 @@ class SepAligThenAttnSink(Algorithm):
         #self.multihead_ff.to(device)
         self.device = device
 
-        self.sink = SinkhornDistance(eps=1e-3, max_iter=1000, reduction='sum')
-        #self.sink = SinkhornDistance(eps=1e-1, max_iter=1000, reduction='sum')
+        #self.sink = SinkhornDistance(eps=1e-3, max_iter=1000, reduction='sum')
+        self.sink = MMD_loss()
 
     def update(self, src_x, src_y, trg_x,trg_y,step,epoch,len_dataloader):
-
+        #self.feature_extractor.train()
+        #self.classifier_list_ind.train()
+        #self.classifier.train()
 
         #self.optimizer_ind.zero_grad()
         self.optimizer_comb.zero_grad()
@@ -1887,8 +2137,10 @@ class SepAligThenAttnSink(Algorithm):
         trg_reps_list_chnl = self.feature_extractor.fetch_individual_reps(trg_x)
         align_loss = 0
         for k in range(0, self.true_input_channel):
-            #align_loss_k = self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])[0]
-            align_loss_k =  + self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])[0]
+            align_loss_k = self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])
+            #align_loss_k =  + self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])[0]
+            # for mmd experiments
+            #align_loss_k = + self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])
             #clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
 
             #idx_src = torch.where(src_y == 3)[0]
@@ -1928,8 +2180,10 @@ class SepAligThenAttnSink(Algorithm):
         comb_reps_trg,trg_comb_attn  = self.feature_extractor.combine_ind_through_attn(trg_reps_list_chnl)
 
 
-        domain_loss = self.sink(comb_reps_src,comb_reps_trg)[0]# +self.sink(comb_reps_src,comb_reps_trg)[0]
+        domain_loss = self.sink(comb_reps_src,comb_reps_trg)# +self.sink(comb_reps_src,comb_reps_trg)[0]
 
+        #for mmd experiments. Otherwise remove blow and uncomment above
+        #domain_loss = self.sink(comb_reps_src, comb_reps_trg)
         if epoch> 0:
 
             loss_comb = 1*(self.hparams["src_cls_loss_wt"] * loss_sup_src + \
@@ -2017,7 +2271,212 @@ class SepAligThenAttnSink(Algorithm):
 
         # self.ema.update()
         return {'Total_loss': np.mean(tloss_list), 'Src_cls_loss':np.mean(src_loss_list), 'Domain_loss': np.mean(dom_loss_list)}
+class SepAligSameEncThenAttnSink(Algorithm):
+    """
+    Separate representations for each chanell. Multihead attention to combine them. Loss applied on combined term
+    """
 
+    def __init__(self, backbone_fe, configs, hparams, device):
+        super(SepAligSameEncThenAttnSink, self).__init__(configs)
+        true_final_out_channels = configs.true_final_out_channels
+        configs.final_out_channels = true_final_out_channels
+        self.true_input_channel = configs.input_channels
+        self.feature_extractor = SepRepsComEnc_with_multihead(configs,backbone_fe)
+
+
+        self.classifier_list_ind = nn.ModuleList([])
+        self.domain_classifier_list_ind = nn.ModuleList([])
+        for k in range(0,self.true_input_channel):
+            self.classifier_list_ind.append(classifier(configs))
+
+        #for k in range(0,self.true_input_channel):
+        #    self.classifier_list_ind.append(classifier(configs))
+        self.optimizer_ind = torch.optim.Adam(
+            list(self.feature_extractor.backbone_nets.parameters())  +\
+       list(self.classifier_list_ind.parameters()),
+            lr=1 * hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"], betas=(0.5, 0.99))
+
+
+
+        configs.input_channels = self.true_input_channel
+        configs.final_out_channels = true_final_out_channels * self.true_input_channel
+
+        self.classifier = classifier(configs)
+
+        self.optimizer_comb = torch.optim.Adam(list(self.feature_extractor.backbone_nets.parameters())  +\
+       list(self.classifier_list_ind.parameters()) +list(self.feature_extractor.multihead_attention.parameters())+
+                                               list(self.classifier.parameters()),lr=1 * hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"], betas=(0.5, 0.99))
+
+        self.hparams = hparams
+        self.feature_extractor.to(device)
+
+        self.classifier.to(device)
+
+        self.classifier_list_ind.to(device)
+        #self.multihead.to(device)
+        #self.multihead_ff.to(device)
+        self.device = device
+
+        self.sink = SinkhornDistance(eps=1e-3, max_iter=1000, reduction='sum')
+        #self.sink = MMD_loss()
+
+    def update(self, src_x, src_y, trg_x,trg_y,step,epoch,len_dataloader):
+
+
+        #self.optimizer_ind.zero_grad()
+        self.optimizer_comb.zero_grad()
+
+
+
+
+
+        src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(src_x)
+
+        clfr_src_list = 0
+        for k in range(0,self.true_input_channel):
+            clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+            clfr_src_list = clfr_src_list + (self.cross_entropy( clfr_k_pred.squeeze(), src_y))
+
+
+        trg_reps_list_chnl = self.feature_extractor.fetch_individual_reps(trg_x)
+        align_loss = 0
+        for k in range(0, self.true_input_channel):
+            align_loss_k = self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])[0]
+            #align_loss_k =  + self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])[0]
+            # for mmd experiments
+            #align_loss_k = + self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])
+            #clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+
+            #idx_src = torch.where(src_y == 3)[0]
+            #idx_src = torch.where(trg_y == 3)[0]
+            #map = self.sink(src_reps_list_chnl[k][idx_src, :], trg_reps_list_chnl[k])[1].detach().cpu()
+            #P = torch.cdist(src_x[idx_src,k,:],trg_x[:,k,:]).detach().cpu()
+            #torch.argmax(clfr_k_pred, dim=-1)[idx_src]
+            #clfr_loss = self.cross_entropy( clfr_k_pred.squeeze(), src_y)
+            #chnl_loss = clfr_loss +align_loss_k
+            #chnl_loss.backward(retain_graph=True)
+            align_loss = align_loss + align_loss_k
+
+
+
+
+
+        domain_loss_ind = 1*torch.sum(clfr_src_list ) + torch.sum(align_loss  )
+        loss_ind = self.hparams["src_cls_loss_wt"] * torch.sum(clfr_src_list) + \
+              1* self.hparams["domain_loss_wt"] * domain_loss_ind
+        #loss_ind.backward()
+        #self.optimizer_ind.step()
+
+        #loss_ind_total = loss_ind.item()
+
+        #self.optimizer_comb.zero_grad()
+
+        #self.optimizer_ind.zero_grad()
+
+
+
+        comb_reps_src,src_comb_attn = self.feature_extractor.combine_ind_through_attn(src_reps_list_chnl)
+        clfr_pred_comb = self.classifier(comb_reps_src)
+        loss_sup_src = self.cross_entropy(clfr_pred_comb.squeeze(),src_y)
+
+
+
+        comb_reps_trg,trg_comb_attn  = self.feature_extractor.combine_ind_through_attn(trg_reps_list_chnl)
+
+
+        domain_loss = self.sink(comb_reps_src,comb_reps_trg)[0]# +self.sink(comb_reps_src,comb_reps_trg)[0]
+
+        #for mmd experiments. Otherwise remove blow and uncomment above
+        #domain_loss = self.sink(comb_reps_src, comb_reps_trg)
+        if epoch> 0:
+
+            loss_comb = 1*(self.hparams["src_cls_loss_wt"] * loss_sup_src + \
+                       self.hparams["domain_loss_wt"]*1 * domain_loss) + 1*loss_ind
+        else:
+            loss_comb = 0
+
+        loss_comb.backward()
+        self.optimizer_comb.step()
+
+        loss_comb_total = loss_comb.item()
+
+        #reps_src_per_c = self.feature_extractor.fetch_individual_reps(src_x)
+        #reps_trg_per_c = self.feature_extractor.fetch_individual_reps(trg_x)
+
+       # for k in range(0,3):
+
+
+    # self.ema.update()
+        return {'Total_loss': loss_comb_total,'Src_cls_loss':loss_sup_src.item(),'Domain_loss':domain_loss.item()}
+
+
+    def get_ind_scores(self,x):
+        #self.feature_extractor.eval()
+        #self.classifier_list_ind.eval()
+
+        pred_prob_list =[]
+        pred_list =[]
+        with torch.no_grad():
+            src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(x)
+            for k in range(0, self.true_input_channel):
+                pred_prob_list.append(self.classifier_list_ind[k](src_reps_list_chnl[k]).detach().cpu())
+                pred_list.append(self.classifier_list_ind[k](src_reps_list_chnl[k]).argmax(dim=1).detach().cpu())
+        return pred_prob_list,pred_list
+
+
+    def eval_update(self, src,trg):
+        joint_loaders = enumerate(zip(src, trg))
+        len_dataloader = min(len(src), len(trg))
+        src_loss_list = []
+        dom_loss_list = []
+        tloss_list = []
+        with torch.no_grad():
+            for step, ((src_x, src_y), (trg_x, trg_y)) in joint_loaders:
+                src_x, src_y, trg_x, trg_y = src_x.float().to(self.device), src_y.long().to(self.device), \
+                                             trg_x.float().to(self.device), trg_y.to(self.device)
+
+
+
+                domain_label_src = torch.ones(len(src_x)).to(self.device)
+                domain_label_trg = torch.zeros(len(trg_x)).to(self.device)
+
+                src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(src_x)
+
+                clfr_src_list = 0
+                for k in range(0, self.true_input_channel):
+                    clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+                    clfr_src_list = clfr_src_list + (self.cross_entropy(clfr_k_pred.squeeze(), src_y))
+                trg_reps_list_chnl = self.feature_extractor.fetch_individual_reps(trg_x)
+                align_loss = 0
+                for k in range(0, self.true_input_channel):
+                    align_loss_k = self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])
+
+                    align_loss = align_loss + align_loss_k[0]
+
+                domain_loss_ind = torch.sum(clfr_src_list) + torch.sum(align_loss)
+                loss_ind = self.hparams["src_cls_loss_wt"] * torch.sum(clfr_src_list) + \
+                           self.hparams["domain_loss_wt"] * domain_loss_ind
+
+
+                comb_reps_src = self.feature_extractor.combine_ind_through_attn(src_reps_list_chnl)
+                clfr_pred_comb = self.classifier(comb_reps_src)
+                loss_sup_src = self.cross_entropy(clfr_pred_comb.squeeze(), src_y)
+
+                comb_reps_trg = self.feature_extractor.combine_ind_through_attn(trg_reps_list_chnl)
+
+                domain_loss = self.sink(comb_reps_src, comb_reps_trg)[0]
+
+                loss_comb = self.hparams["src_cls_loss_wt"] * loss_sup_src + \
+                            self.hparams["domain_loss_wt"] * domain_loss + 0.3*loss_ind
+
+                dom_loss_list.append(domain_loss.item())
+                src_loss_list.append(loss_sup_src.item())
+                tloss_list.append(loss_comb.item())
+
+        # self.ema.update()
+        return {'Total_loss': np.mean(tloss_list), 'Src_cls_loss':np.mean(src_loss_list), 'Domain_loss': np.mean(dom_loss_list)}
 class NoSepAligThenAttnSink(Algorithm):
     """
     Separate representations for each chanell. Multihead attention to combine them. Loss applied on combined term
@@ -2069,7 +2528,9 @@ class NoSepAligThenAttnSink(Algorithm):
         #self.sink = SinkhornDistance(eps=1e-1, max_iter=1000, reduction='sum')
 
     def update(self, src_x, src_y, trg_x,trg_y,step,epoch,len_dataloader):
-
+        self.feature_extractor.train()
+        self.classifier_list_ind.train()
+        self.classifier.train()
 
         #self.optimizer_ind.zero_grad()
         self.optimizer_comb.zero_grad()
@@ -2153,8 +2614,8 @@ class NoSepAligThenAttnSink(Algorithm):
 
 
     def get_ind_scores(self,x):
-        #self.feature_extractor.eval()
-        #self.classifier_list_ind.eval()
+        self.feature_extractor.eval()
+        self.classifier_list_ind.eval()
 
         pred_prob_list =[]
         pred_list =[]
@@ -2418,6 +2879,211 @@ class SepAligThenNoAttnSink(Algorithm):
 
         # self.ema.update()
         return {'Total_loss': np.mean(tloss_list), 'Src_cls_loss':np.mean(src_loss_list), 'Domain_loss': np.mean(dom_loss_list)}
+
+
+
+class SepAligThenNoAttnMMD(Algorithm):
+    """
+    Separate representations for each chanell. Multihead attention to combine them. Loss applied on combined term
+    """
+
+    def __init__(self, backbone_fe, configs, hparams, device):
+        super(SepAligThenNoAttnMMD, self).__init__(configs)
+        true_final_out_channels = configs.true_final_out_channels
+        configs.final_out_channels = true_final_out_channels
+        self.true_input_channel = configs.input_channels
+        self.feature_extractor = SepReps_with_multihead(configs,backbone_fe)
+
+
+        self.classifier_list_ind = nn.ModuleList([])
+        self.domain_classifier_list_ind = nn.ModuleList([])
+        for k in range(0,self.true_input_channel):
+            self.classifier_list_ind.append(classifier(configs))
+
+
+        self.optimizer_ind = torch.optim.Adam(
+            list(self.feature_extractor.backbone_nets.parameters())  +\
+       list(self.classifier_list_ind.parameters()),
+            lr=1 * hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"], betas=(0.5, 0.99))
+
+
+
+        configs.input_channels = self.true_input_channel
+        configs.final_out_channels = true_final_out_channels * self.true_input_channel
+
+        self.classifier = classifier(configs)
+
+        self.optimizer_comb = torch.optim.Adam(list(self.feature_extractor.backbone_nets.parameters())  +\
+       list(self.classifier_list_ind.parameters()) +list(self.feature_extractor.multihead_attention.parameters())+
+                                               list(self.classifier.parameters()),lr=1 * hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"], betas=(0.5, 0.99))
+
+        self.hparams = hparams
+        self.feature_extractor.to(device)
+
+        self.classifier.to(device)
+
+        self.classifier_list_ind.to(device)
+        #self.multihead.to(device)
+        #self.multihead_ff.to(device)
+        self.device = device
+
+        #self.sink = SinkhornDistance(eps=1e-3, max_iter=1000, reduction='sum')
+        #self.sink = SinkhornDistance(eps=1e-1, max_iter=1000, reduction='sum')
+        self.sink =  MMD_loss()
+    def update(self, src_x, src_y, trg_x,trg_y,step,epoch,len_dataloader):
+
+
+        #self.optimizer_ind.zero_grad()
+        self.optimizer_comb.zero_grad()
+
+
+
+
+
+        src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(src_x)
+
+        clfr_src_list = 0
+        for k in range(0,self.true_input_channel):
+            clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+            clfr_src_list = clfr_src_list + (self.cross_entropy( clfr_k_pred.squeeze(), src_y))
+
+
+        trg_reps_list_chnl = self.feature_extractor.fetch_individual_reps(trg_x)
+        align_loss = 0
+        for k in range(0, self.true_input_channel):
+            #align_loss_k = self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])[0]
+            align_loss_k =  + self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])
+            #clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+
+            #idx_src = torch.where(src_y == 3)[0]
+            #idx_src = torch.where(trg_y == 3)[0]
+            #map = self.sink(src_reps_list_chnl[k][idx_src, :], trg_reps_list_chnl[k])[1].detach().cpu()
+            #P = torch.cdist(src_x[idx_src,k,:],trg_x[:,k,:]).detach().cpu()
+            #torch.argmax(clfr_k_pred, dim=-1)[idx_src]
+            #clfr_loss = self.cross_entropy( clfr_k_pred.squeeze(), src_y)
+            #chnl_loss = clfr_loss +align_loss_k
+            #chnl_loss.backward(retain_graph=True)
+            align_loss = align_loss + align_loss_k
+
+
+
+
+
+        domain_loss_ind = 1*torch.sum(clfr_src_list ) + torch.sum(align_loss  )
+        loss_ind = self.hparams["src_cls_loss_wt"] * torch.sum(clfr_src_list) + \
+               self.hparams["domain_loss_wt"] * domain_loss_ind
+        #loss_ind.backward()
+        #self.optimizer_ind.step()
+
+        #loss_ind_total = loss_ind.item()
+
+        #self.optimizer_comb.zero_grad()
+
+        #self.optimizer_ind.zero_grad()
+
+
+
+        comb_reps_src = torch.hstack(src_reps_list_chnl)
+        clfr_pred_comb = self.classifier(comb_reps_src)
+        loss_sup_src = self.cross_entropy(clfr_pred_comb.squeeze(),src_y)
+
+
+
+        comb_reps_trg = torch.hstack(trg_reps_list_chnl)
+
+
+        domain_loss = self.sink(comb_reps_src,comb_reps_trg)# +self.sink(comb_reps_src,comb_reps_trg)[0]
+
+        if epoch> 0:
+
+            loss_comb = 1*(self.hparams["src_cls_loss_wt"] * loss_sup_src + \
+                       self.hparams["domain_loss_wt"]*1 * domain_loss) + 1*loss_ind
+        else:
+            loss_comb = 0
+
+        loss_comb.backward()
+        self.optimizer_comb.step()
+
+        loss_comb_total = loss_comb.item()
+
+        #reps_src_per_c = self.feature_extractor.fetch_individual_reps(src_x)
+        #reps_trg_per_c = self.feature_extractor.fetch_individual_reps(trg_x)
+
+       # for k in range(0,3):
+
+
+    # self.ema.update()
+        return {'Total_loss': loss_comb_total,'Src_cls_loss':loss_sup_src.item(),'Domain_loss':domain_loss.item()}
+
+
+    def get_ind_scores(self,x):
+        #self.feature_extractor.eval()
+        #self.classifier_list_ind.eval()
+
+        pred_prob_list =[]
+        pred_list =[]
+        with torch.no_grad():
+            src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(x)
+            for k in range(0, self.true_input_channel):
+                pred_prob_list.append(self.classifier_list_ind[k](src_reps_list_chnl[k]).detach().cpu())
+                pred_list.append(self.classifier_list_ind[k](src_reps_list_chnl[k]).argmax(dim=1).detach().cpu())
+        return pred_prob_list,pred_list
+
+
+    def eval_update(self, src,trg):
+        joint_loaders = enumerate(zip(src, trg))
+        len_dataloader = min(len(src), len(trg))
+        src_loss_list = []
+        dom_loss_list = []
+        tloss_list = []
+        with torch.no_grad():
+            for step, ((src_x, src_y), (trg_x, trg_y)) in joint_loaders:
+                src_x, src_y, trg_x, trg_y = src_x.float().to(self.device), src_y.long().to(self.device), \
+                                             trg_x.float().to(self.device), trg_y.to(self.device)
+
+
+
+                domain_label_src = torch.ones(len(src_x)).to(self.device)
+                domain_label_trg = torch.zeros(len(trg_x)).to(self.device)
+
+                src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(src_x)
+
+                clfr_src_list = 0
+                for k in range(0, self.true_input_channel):
+                    clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+                    clfr_src_list = clfr_src_list + (self.cross_entropy(clfr_k_pred.squeeze(), src_y))
+                trg_reps_list_chnl = self.feature_extractor.fetch_individual_reps(trg_x)
+                align_loss = 0
+                for k in range(0, self.true_input_channel):
+                    align_loss_k = self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])
+
+                    align_loss = align_loss + align_loss_k[0]
+
+                domain_loss_ind = torch.sum(clfr_src_list) + torch.sum(align_loss)
+                loss_ind = self.hparams["src_cls_loss_wt"] * torch.sum(clfr_src_list) + \
+                           self.hparams["domain_loss_wt"] * domain_loss_ind
+
+
+                comb_reps_src = self.feature_extractor.combine_ind_through_attn(src_reps_list_chnl)
+                clfr_pred_comb = self.classifier(comb_reps_src)
+                loss_sup_src = self.cross_entropy(clfr_pred_comb.squeeze(), src_y)
+
+                comb_reps_trg = self.feature_extractor.combine_ind_through_attn(trg_reps_list_chnl)
+
+                domain_loss = self.sink(comb_reps_src, comb_reps_trg)[0]
+
+                loss_comb = self.hparams["src_cls_loss_wt"] * loss_sup_src + \
+                            self.hparams["domain_loss_wt"] * domain_loss + 0.3*loss_ind
+
+                dom_loss_list.append(domain_loss.item())
+                src_loss_list.append(loss_sup_src.item())
+                tloss_list.append(loss_comb.item())
+
+        # self.ema.update()
+        return {'Total_loss': np.mean(tloss_list), 'Src_cls_loss':np.mean(src_loss_list), 'Domain_loss': np.mean(dom_loss_list)}
+
 class SepAligThenSum(Algorithm):
     """
     Separate representations for each chanell. Multihead attention to combine them. Loss applied on combined term
@@ -2895,3 +3561,670 @@ class CLUDA(Algorithm):
         # if there is only one channel but not long, we just need to make sure that we don't drop this only channel
         else:
             self.augmenter = Augmenter(cutout_length=cutout_len, dropout_prob=0.0)
+
+
+class SASA(Algorithm):
+
+    def __init__(self, backbone, configs, hparams, device):
+        super().__init__(configs)
+
+        # feature_length for classifier
+        configs.features_len = 1
+        self.classifier = classifier(configs)
+        # feature length for feature extractor
+        configs.features_len = 1
+        self.feature_extractor = CNN_ATTN(configs)
+        self.network = nn.Sequential(self.feature_extractor, self.classifier)
+
+        # optimizer and scheduler
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"]
+        )
+        #self.lr_scheduler = StepLR(self.optimizer, step_size=hparams['step_size'], gamma=hparams['lr_decay'])
+        # hparams
+        self.hparams = hparams
+        # device
+        self.device = device
+
+    def update(self, src_x, src_y, trg_x):
+
+
+
+        # Extract features
+
+        len_m = min(src_x.shape[0],trg_x.shape[0])
+        src_x = src_x[0:len_m,:,:]
+        trg_x = trg_x[0:len_m,:,:]
+
+        src_y = src_y[0:len_m]
+        src_feature = self.feature_extractor(src_x)
+        tgt_feature = self.feature_extractor(trg_x)
+
+        # source classification loss
+        y_pred = self.classifier(src_feature)
+        src_cls_loss = self.cross_entropy(y_pred, src_y)
+
+        # MMD loss
+        domain_loss_intra = self.mmd_loss(src_struct=src_feature,
+                                          tgt_struct=tgt_feature, weight=self.hparams['domain_loss_wt'])
+
+        # total loss
+        total_loss = self.hparams['src_cls_loss_wt'] * src_cls_loss + domain_loss_intra
+
+        # remove old gradients
+        self.optimizer.zero_grad()
+        # calculate gradients
+        total_loss.backward()
+        # update the weights
+        self.optimizer.step()
+
+
+
+        return {'Total_loss': total_loss.item(), 'Domain_loss':  domain_loss_intra.item(), 'Src_cls_loss': src_cls_loss.item(),
+                }
+
+        #self.lr_scheduler.step()
+
+    def mmd_loss(self, src_struct, tgt_struct, weight):
+
+        delta = torch.mean(src_struct - tgt_struct, dim=-2)
+        loss_value = torch.norm(delta, 2) * weight
+        return loss_value
+
+
+class JDOT(Algorithm):
+    """
+    MMDA: https://arxiv.org/abs/1901.00282
+    """
+
+    def __init__(self, backbone_fe, configs, hparams, device):
+        super(JDOT, self).__init__(configs)
+
+
+        self.sink = SinkhornDistance_custom(eps=1e-3, max_iter=1000, reduction='sum')
+        self.feature_extractor = backbone_fe(configs)
+        #self.feature_extractor = simple_average_feed_forward(configs)
+        self.classifier = classifier(configs)
+        self.network = nn.Sequential(self.feature_extractor, self.classifier)
+
+        self.optimizer = torch.optim.Adam(
+            list(self.feature_extractor.parameters())+list(self.classifier.parameters()),
+            lr=hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"]
+        )
+        self.hparams = hparams
+        self.device = device
+
+    def pairwise_cross_entropy(self,labels1, inputs2):
+        """
+        Computes pairwise cross entropy loss matrix between labels and input vectors.
+
+        Args:
+            labels1: A PyTorch tensor of shape (batch_size1) containing integer class labels for the first set.
+            inputs2: A PyTorch tensor of shape (batch_size2, embedding_size) containing the second set of vectors.
+
+        Returns:
+            A PyTorch tensor of shape (batch_size1, batch_size2) containing pairwise cross entropy loss.
+        """
+        # Convert labels to one-hot encoding
+        num_classes = inputs2.size(1)  # Assuming embedding size represents number of classes
+        onehot_labels1 = torch.nn.functional.one_hot(labels1.long(), num_classes=num_classes).float()
+
+        # Normalize for numerical stability (optional)
+        normed_onehot_labels1 = nn.functional.log_softmax(onehot_labels1.float(), dim=1)
+
+        # Expand for broadcasting (batch_size1, 1, embedding_size)
+        expanded_onehot_labels1 = normed_onehot_labels1.unsqueeze(1)
+
+        # Calculate pairwise loss (batch_size1, batch_size2, embedding_size)
+        loss = nn.NLLLoss()(expanded_onehot_labels1, inputs2)
+
+        return loss
+
+    def update(self, src_x, src_y, trg_x):
+
+        self.optimizer.zero_grad()
+        src_feat = self.feature_extractor(src_x)
+        trg_feat = self.feature_extractor(trg_x)
+
+        trg_pred = self.classifier(trg_feat)
+
+        x_col =  src_feat.unsqueeze(-2)
+        y_lin = trg_feat.unsqueeze(-3)
+        C0 = torch.sum((torch.abs(x_col - y_lin)) ** 2, -1)
+
+        num_classes = trg_pred.size(1)  # Assuming embedding size represents number of classes
+        onehot_labels1 = torch.nn.functional.one_hot(src_y.long(), num_classes=num_classes).float()
+
+        trg_argmax  = torch.argmax(trg_pred,dim=1)
+
+        trg_onehot= torch.nn.functional.one_hot(trg_argmax.long(), num_classes=num_classes).float()
+        C1 = torch.cdist(onehot_labels1,trg_onehot)
+
+        C = C1+C0
+
+        #coral_loss = self.coral(src_feat, trg_feat)
+        domain_loss = self.sink(src_feat, trg_feat,C)[0]
+        #cond_ent_loss = self.cond_ent(trg_feat)
+        loss_domain = domain_loss
+        loss_domain.backward(retain_graph=True)
+
+        src_pred = self.classifier(src_feat)
+
+        src_cls_loss = self.cross_entropy(src_pred, src_y)
+        loss_sup =src_cls_loss # self.hparams["src_cls_loss_wt"]* src_cls_loss #1*self.hparams['sinkdiv_loss_wt']*domain_loss
+
+
+
+        loss_sup.backward(retain_graph=True)
+        self.optimizer.step()
+        #domain_loss.detach()
+        return {'Total_loss': loss_sup.item()+domain_loss.item(), 'Src_cls_loss': src_cls_loss.item(),'Domain_loss':domain_loss.item()}
+
+
+    def eval_update(self, src,trg):
+        joint_loaders = enumerate(zip(src, trg))
+        len_dataloader = min(len(src), len(trg))
+        src_loss_list = []
+        dom_loss_list = []
+        tloss_list = []
+        with torch.no_grad():
+            for step, ((src_x, src_y), (trg_x, trg_y)) in joint_loaders:
+                src_x, src_y, trg_x, trg_y = src_x.float().to(self.device), src_y.long().to(self.device), \
+                                             trg_x.float().to(self.device), trg_y.to(self.device)
+                src_feat = self.feature_extractor(src_x)
+                src_pred = self.classifier(src_feat)
+
+                src_cls_loss = self.cross_entropy(src_pred, src_y)
+
+                trg_feat = self.feature_extractor(trg_x)
+
+                # coral_loss = self.coral(src_feat, trg_feat)
+                domain_loss = self.sink(src_feat, trg_feat)[0]
+                # cond_ent_loss = self.cond_ent(trg_feat)
+
+                loss = self.hparams["src_cls_loss_wt"] * src_cls_loss + self.hparams['sinkdiv_loss_wt'] * domain_loss
+                dom_loss_list.append(domain_loss.item())
+                src_loss_list.append(src_cls_loss.item())
+                tloss_list.append(loss.item())
+
+        # self.ema.update()
+        return {'Total_loss': np.mean(tloss_list), 'Src_cls_loss':np.mean(src_loss_list), 'Domain_loss': np.mean(dom_loss_list)}
+
+
+class CoTMix(Algorithm):
+    def __init__(self, backbone_fe, configs, hparams, device):
+        super(CoTMix, self).__init__(configs)
+
+        self.feature_extractor = backbone_fe(configs)
+        self.classifier = classifier(configs)
+
+        self.network = nn.Sequential(self.feature_extractor, self.classifier)
+
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"]
+        )
+        self.hparams = hparams
+
+        self.contrastive_loss = NTXentLoss(device, hparams["batch_size"], 0.2, True)
+        self.entropy_loss = ConditionalEntropyLoss()
+        self.sup_contrastive_loss = SupConLoss2(device)
+
+    def update(self, src_x, src_y, trg_x):
+        # ====== Temporal Mixup =====================
+        x1_size = min(src_x.shape[0],trg_x.shape[0])
+        src_x = src_x[0:x1_size,:,:]
+        trg_x = trg_x[0:x1_size,:,:]
+        src_y = src_y[0:x1_size]
+        mix_ratio = round(self.hparams['mix_ratio'], 2)
+        temporal_shift = self.hparams['temporal_shift']
+        h = temporal_shift // 2  # half
+
+        src_dominant = mix_ratio * src_x + (1 - mix_ratio) * \
+                       torch.mean(torch.stack([torch.roll(trg_x, -i, 2) for i in range(-h, h)], 2), 2)
+
+        trg_dominant = mix_ratio * trg_x + (1 - mix_ratio) * \
+                       torch.mean(torch.stack([torch.roll(src_x, -i, 2) for i in range(-h, h)], 2), 2)
+
+        # ====== Extract features and calc logits =====================
+        self.optimizer.zero_grad()
+
+        # Src original features
+        src_orig_feat = self.feature_extractor(src_x)
+        src_orig_logits = self.classifier(src_orig_feat)
+
+        # Target original features
+        trg_orig_feat = self.feature_extractor(trg_x)
+        trg_orig_logits = self.classifier(trg_orig_feat)
+
+        # -----------  The two main losses: L_CE on source and L_ent on target
+        # Cross-Entropy loss
+        src_cls_loss = self.cross_entropy(src_orig_logits, src_y)
+        loss = src_cls_loss * round(self.hparams['src_cls_weight'], 2)
+
+        # Target Entropy loss
+        trg_entropy_loss = self.entropy_loss(trg_orig_logits)
+        loss += trg_entropy_loss * round(self.hparams['trg_entropy_weight'], 2)
+
+        # -----------  Auxiliary losses
+        # Extract source-dominant mixup features.
+        src_dominant_feat = self.feature_extractor(src_dominant)
+        src_dominant_logits = self.classifier(src_dominant_feat)
+
+        # supervised contrastive loss on source domain side
+        src_concat = torch.cat([src_orig_logits.unsqueeze(1), src_dominant_logits.unsqueeze(1)], dim=1)
+        src_supcon_loss = self.sup_contrastive_loss(src_concat, src_y)
+        # src_con_loss = self.contrastive_loss(src_orig_logits, src_dominant_logits) # unsupervised_contrasting
+        loss += src_supcon_loss * round(self.hparams['src_supCon_weight'], 2)
+
+        # Extract target-dominant mixup features.
+        trg_dominant_feat = self.feature_extractor(trg_dominant)
+        trg_dominant_logits = self.classifier(trg_dominant_feat)
+
+        # Unsupervised contrastive loss on target domain side
+        trg_con_loss = self.contrastive_loss(trg_orig_logits, trg_dominant_logits,x1_size)
+        loss += trg_con_loss * round(self.hparams['trg_cont_weight'], 2)
+
+        loss.backward()
+        self.optimizer.step()
+
+        return {'Total_loss': loss.item(),
+                'Src_cls_loss': src_cls_loss.item(),
+                'trg_entropy_loss': trg_entropy_loss.item(),
+                'Domain_loss': src_supcon_loss.item(),
+                'trg_con_loss': trg_con_loss.item()
+                }
+
+class TestTime_adapt(Algorithm):
+    def __init__(self, backbone_fe, configs, hparams, device):
+        super(TestTime_adapt, self).__init__(configs)
+        self.device = device
+        self.feature_extractor = backbone_fe(configs)
+        # self.feature_extractor = simple_average_feed_forward(configs)
+        # backbone_fe(configs)
+
+        self.classifier = classifier(configs)
+        self.network = nn.Sequential(self.feature_extractor, self.classifier)
+
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"]
+        )
+        self.hparams = hparams
+
+    def update(self, src_x, src_y, trg_x):
+        src_feat = self.feature_extractor(src_x)
+
+        src_pred = self.classifier(src_feat)
+
+        src_cls_loss = self.cross_entropy(src_pred, src_y)
+
+        # trg_feat = self.feature_extractor(trg_x)
+
+        # coral_loss = self.coral(src_feat, trg_feat)
+        # mmd_loss = self.mmd(src_feat, trg_feat)
+        # cond_ent_loss = self.cond_ent(trg_feat)
+
+        loss = self.hparams["src_cls_loss_wt"] * src_cls_loss
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'Total_loss': loss.item(), 'Src_cls_loss': src_cls_loss.item(), 'Domain_loss': 0}
+
+    def compute_was(self,stats_src,stats_trg):
+        mean_src = stats_src[0]
+        var_src = stats_src[1]
+
+        mean_trg = stats_trg[0][0]
+        var_trg = stats_trg[0][1]
+
+        score = torch.abs(mean_src - mean_trg)**2 + (var_src - var_trg)**2
+
+        return score
+    def evaluate(self,src_dataloader,target_test_dataloader):
+        feature_extractor = self.feature_extractor
+        classifier = self.classifier
+        #feature_extractor.eval()
+        feature_extractor.train()
+        with torch.no_grad():
+            init_batch_stats = feature_extractor.get_batch_norm_stats_init().copy()
+            mean_1 = init_batch_stats[0][0].clone()
+            var_1 = init_batch_stats[0][1].clone()
+
+            mean_2 = init_batch_stats[1][0].clone()
+            var_2 = init_batch_stats[1][1].clone()
+
+            mean_3 = init_batch_stats[2][0].clone()
+            var_3 = init_batch_stats[2][1].clone()
+
+            for data, labels in src_dataloader:
+
+
+                data = data.float().to(self.device)
+
+                labels = labels.view((-1)).long().to(self.device)
+                lbl_uniq = torch.unique(labels)
+                list_channel_scores = []
+
+                score_layer_1 = torch.zeros((6,64)).to(self.device)
+                score_layer_2 = torch.zeros((6, 64)).to(self.device)
+                score_layer_3 = torch.zeros((6, 128)).to(self.device)
+                for c in lbl_uniq:
+                    idx_c = torch.where(labels == c)[0]
+                    data_c = data[idx_c,:,:]
+                    layer_1_stats = feature_extractor.get_batch_norm_stats_layer1(data_c )
+                    layer1_mean = layer_1_stats[0].clone()
+                    layer1_var = layer_1_stats[1].clone()
+
+                    score1_c = self.compute_was([layer1_mean,layer1_var],[[mean_1,var_1]])
+                    score_layer_1[c,:] = score1_c
+                    layer_2_stats = feature_extractor.get_batch_norm_stats_layer2(data_c )
+
+                    layer_2_mean = layer_2_stats[0].clone()
+                    layer_2_var = layer_2_stats[1].clone()
+                    score2_c = self.compute_was([layer_2_mean, layer_2_var], [[mean_2, var_2]])
+                    score_layer_2[c, :] = score2_c
+                    layer_3_stats = feature_extractor.get_batch_norm_stats_layer3( data_c)
+
+                    layer_3_mean = layer_3_stats[0].clone()
+                    layer_3_var = layer_3_stats[1].clone()
+
+                    score3_c = self.compute_was([layer_3_mean, layer_3_var], [[mean_3, var_3]])
+                    score_layer_3[c, :] = score3_c
+
+            scores_layer_1_trg = torch.zeros((64,1)).to(self.device).reshape(-1,)
+            scores_layer_2_trg = torch.zeros((64, 1)).to(self.device).reshape(-1,)
+            scores_layer_3_trg = torch.zeros((128, 1)).to(self.device).reshape(-1,)
+
+
+            labels_trg_list = np.asarray([])
+            #for _, labels in target_test_dataloader:
+            #    labels_numpy = labels.detach().cpu().numpy()
+            #    labels_trg_list = np.concatentate((labels_trg_list, labels_numpy),axis=0) if len(labels_trg_list) else labels_numpy
+
+            label_unique_target = np.unique(labels_trg_list)
+            label_weight = np.zeros((len(lbl_uniq),1))
+
+            for c in range(0,len(lbl_uniq)):
+                idx_c = np.where(labels_trg_list == c)[0]
+                label_weight[c] = len(idx_c)
+
+            class_weight_prior_t = torch.from_numpy(label_weight / label_weight.sum()).to(self.device)
+
+            self.trg_pred_labels = np.array([])
+            self.trg_true_labels = np.array([])
+            for data, labels in target_test_dataloader:
+                data = data.float().to(self.device)
+                labels_true = labels.view((-1)).long().to(self.device)
+
+                layer_1_stats_trg = feature_extractor.get_batch_norm_stats_layer1(data)
+                layer_1_stats_trg_mean = layer_1_stats_trg[0].clone()
+                layer_1_stats_trg_var = layer_1_stats_trg[1].clone()
+
+
+                layer_2_stats_trg = feature_extractor.get_batch_norm_stats_layer2(data)
+
+                layer_2_stats_trg_mean = layer_2_stats_trg[0].clone()
+                layer_2_stats_trg_var = layer_2_stats_trg[1].clone()
+
+
+                layer_3_stats_trg = feature_extractor.get_batch_norm_stats_layer3(data_c)
+
+                layer_3_stats_trg_mean = layer_3_stats_trg[0].clone()
+                layer_3_stats_trg_var = layer_3_stats_trg[1].clone()
+
+                for c in lbl_uniq:
+                    scores_layer_1_trg = scores_layer_1_trg + (1.0/len(lbl_uniq))*score_layer_1[c,:]
+                    scores_layer_2_trg = scores_layer_2_trg + (1.0/len(lbl_uniq)) * score_layer_2[c, :]
+                    scores_layer_3_trg = scores_layer_3_trg + (1.0/len(lbl_uniq)) * score_layer_3[c, :]
+                _,layer1_top_idx = torch.topk(scores_layer_1_trg,7)
+                _,layer2_top_idx = torch.topk(scores_layer_1_trg, 7)
+                _,layer3_top_idx = torch.topk(scores_layer_1_trg, 14)
+
+                mu_layer1 = torch.ones(layer_1_stats_trg_mean.shape).to(self.device)
+                mu_layer2 = torch.ones(layer_2_stats_trg_mean.shape).to(self.device)
+                mu_layer3 = torch.ones(layer_3_stats_trg_mean.shape).to(self.device)
+
+
+                #var_layer1 = torch.ones(layer_1_stats_trg_var.shape).to(self.device)
+                mu_layer1[layer1_top_idx] = 0
+                mu_layer2[layer2_top_idx] = 0
+                mu_layer3[layer3_top_idx] = 0
+                layer1_mean_hybrid = mu_layer1*layer_1_stats_trg_mean + (1-mu_layer1)*mean_1
+                layer1_var_hybrid = mu_layer1 * layer_1_stats_trg_var + (1 - mu_layer1) * var_1
+
+                layer2_mean_hybrid = mu_layer2 * layer_2_stats_trg_mean + (1 - mu_layer2) * mean_2
+                layer2_var_hybrid = mu_layer2 * layer_2_stats_trg_var + (1 - mu_layer2) * var_2
+
+                layer3_mean_hybrid = mu_layer3 * layer_3_stats_trg_mean + (1 - mu_layer3) * mean_3
+                layer3_var_hybrid = mu_layer3 * layer_3_stats_trg_var + (1 - mu_layer3) * var_3
+
+                feature_extractor.set_1st_layer_batchnorm(layer1_mean_hybrid,layer1_var_hybrid)
+                #feature_extractor.set_2nd_layer_batchnorm(layer2_mean_hybrid, layer2_var_hybrid)
+                #feature_extractor.set_3rd_layer_batchnorm(layer3_mean_hybrid, layer3_var_hybrid)
+                #feature_extractor.eval()
+                features = feature_extractor(data)
+                predictions = classifier(features)
+
+                pred = predictions.detach().argmax(dim=1)
+                self.trg_pred_labels = np.append(self.trg_pred_labels, pred.cpu().numpy())
+                self.trg_true_labels = np.append(self.trg_true_labels, labels_true.cpu().numpy())
+            accuracy_trg = accuracy_score(self.trg_true_labels, self.trg_pred_labels)
+            f1_trg = f1_score(self.trg_true_labels, self.trg_pred_labels, pos_label=None, average="macro")
+        return accuracy_trg, f1_trg
+
+
+class SepAligThenAttnKLDiv(Algorithm):
+    """
+    Separate representations for each chanell. Multihead attention to combine them. Loss applied on combined term
+    """
+
+    def __init__(self, backbone_fe, configs, hparams, device):
+        super(SepAligThenAttnKLDiv, self).__init__(configs)
+        true_final_out_channels = configs.true_final_out_channels
+        configs.final_out_channels = true_final_out_channels
+        self.true_input_channel = configs.input_channels
+        self.feature_extractor = SepReps_with_multihead(configs,backbone_fe)
+
+
+        self.classifier_list_ind = nn.ModuleList([])
+        self.domain_classifier_list_ind = nn.ModuleList([])
+        for k in range(0,self.true_input_channel):
+            self.classifier_list_ind.append(classifier(configs))
+
+
+        self.optimizer_ind = torch.optim.Adam(
+            list(self.feature_extractor.backbone_nets.parameters())  +\
+       list(self.classifier_list_ind.parameters()),
+            lr=1 * hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"], betas=(0.5, 0.99))
+
+
+
+        configs.input_channels = self.true_input_channel
+        configs.final_out_channels = true_final_out_channels * self.true_input_channel
+
+        self.classifier = classifier(configs)
+
+        self.optimizer_comb = torch.optim.Adam(list(self.feature_extractor.backbone_nets.parameters())  +\
+       list(self.classifier_list_ind.parameters()) +list(self.feature_extractor.multihead_attention.parameters())+
+                                               list(self.classifier.parameters()),lr=1 * hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"], betas=(0.5, 0.99))
+
+        self.hparams = hparams
+        self.feature_extractor.to(device)
+
+        self.classifier.to(device)
+
+        self.classifier_list_ind.to(device)
+        #self.multihead.to(device)
+        #self.multihead_ff.to(device)
+        self.device = device
+
+        #self.sink = SinkhornDistance(eps=1e-3, max_iter=1000, reduction='sum')
+        #self.sink = MMD_loss()
+
+    def update(self, src_x, src_y, trg_x,trg_y,step,epoch,len_dataloader):
+        #self.feature_extractor.train()
+        #self.classifier_list_ind.train()
+        #self.classifier.train()
+
+        #self.optimizer_ind.zero_grad()
+        self.optimizer_comb.zero_grad()
+
+
+
+
+
+        src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(src_x)
+
+        clfr_src_list = 0
+        for k in range(0,self.true_input_channel):
+            clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+            clfr_src_list = clfr_src_list + (self.cross_entropy( clfr_k_pred.squeeze(), src_y))
+
+
+        trg_reps_list_chnl = self.feature_extractor.fetch_individual_reps(trg_x)
+        align_loss = 0
+        for k in range(0, self.true_input_channel):
+            align_loss_k = kl_divergence_embeddings(src_reps_list_chnl[k], trg_reps_list_chnl[k])
+            #align_loss_k =  + self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])[0]
+            # for mmd experiments
+            #align_loss_k = + self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])
+            #clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+
+            #idx_src = torch.where(src_y == 3)[0]
+            #idx_src = torch.where(trg_y == 3)[0]
+            #map = self.sink(src_reps_list_chnl[k][idx_src, :], trg_reps_list_chnl[k])[1].detach().cpu()
+            #P = torch.cdist(src_x[idx_src,k,:],trg_x[:,k,:]).detach().cpu()
+            #torch.argmax(clfr_k_pred, dim=-1)[idx_src]
+            #clfr_loss = self.cross_entropy( clfr_k_pred.squeeze(), src_y)
+            #chnl_loss = clfr_loss +align_loss_k
+            #chnl_loss.backward(retain_graph=True)
+            align_loss = align_loss + align_loss_k
+
+
+
+
+
+        domain_loss_ind = 1*torch.sum(clfr_src_list ) + torch.sum(align_loss  )
+        loss_ind = self.hparams["src_cls_loss_wt"] * torch.sum(clfr_src_list) + \
+              1* self.hparams["domain_loss_wt"] * domain_loss_ind
+        #loss_ind.backward()
+        #self.optimizer_ind.step()
+
+        #loss_ind_total = loss_ind.item()
+
+        #self.optimizer_comb.zero_grad()
+
+        #self.optimizer_ind.zero_grad()
+
+
+
+        comb_reps_src,src_comb_attn = self.feature_extractor.combine_ind_through_attn(src_reps_list_chnl)
+        clfr_pred_comb = self.classifier(comb_reps_src)
+        loss_sup_src = self.cross_entropy(clfr_pred_comb.squeeze(),src_y)
+
+
+
+        comb_reps_trg,trg_comb_attn  = self.feature_extractor.combine_ind_through_attn(trg_reps_list_chnl)
+
+
+        domain_loss =  kl_divergence_embeddings(comb_reps_src,comb_reps_trg)# +self.sink(comb_reps_src,comb_reps_trg)[0]
+
+        #for mmd experiments. Otherwise remove blow and uncomment above
+        #domain_loss = self.sink(comb_reps_src, comb_reps_trg)
+        if epoch> 0:
+
+            loss_comb = 1*(self.hparams["src_cls_loss_wt"] * loss_sup_src + \
+                       self.hparams["domain_loss_wt"]*1 * domain_loss) + 1*loss_ind
+        else:
+            loss_comb = 0
+
+        loss_comb.backward()
+        self.optimizer_comb.step()
+
+        loss_comb_total = loss_comb.item()
+
+        #reps_src_per_c = self.feature_extractor.fetch_individual_reps(src_x)
+        #reps_trg_per_c = self.feature_extractor.fetch_individual_reps(trg_x)
+
+       # for k in range(0,3):
+
+
+    # self.ema.update()
+        return {'Total_loss': loss_comb_total,'Src_cls_loss':loss_sup_src.item(),'Domain_loss':domain_loss.item()}
+
+
+    def get_ind_scores(self,x):
+        #self.feature_extractor.eval()
+        #self.classifier_list_ind.eval()
+
+        pred_prob_list =[]
+        pred_list =[]
+        with torch.no_grad():
+            src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(x)
+            for k in range(0, self.true_input_channel):
+                pred_prob_list.append(self.classifier_list_ind[k](src_reps_list_chnl[k]).detach().cpu())
+                pred_list.append(self.classifier_list_ind[k](src_reps_list_chnl[k]).argmax(dim=1).detach().cpu())
+        return pred_prob_list,pred_list
+
+
+    def eval_update(self, src,trg):
+        joint_loaders = enumerate(zip(src, trg))
+        len_dataloader = min(len(src), len(trg))
+        src_loss_list = []
+        dom_loss_list = []
+        tloss_list = []
+        with torch.no_grad():
+            for step, ((src_x, src_y), (trg_x, trg_y)) in joint_loaders:
+                src_x, src_y, trg_x, trg_y = src_x.float().to(self.device), src_y.long().to(self.device), \
+                                             trg_x.float().to(self.device), trg_y.to(self.device)
+
+
+
+                domain_label_src = torch.ones(len(src_x)).to(self.device)
+                domain_label_trg = torch.zeros(len(trg_x)).to(self.device)
+
+                src_reps_list_chnl = self.feature_extractor.fetch_individual_reps(src_x)
+
+                clfr_src_list = 0
+                for k in range(0, self.true_input_channel):
+                    clfr_k_pred = self.classifier_list_ind[k](src_reps_list_chnl[k])
+                    clfr_src_list = clfr_src_list + (self.cross_entropy(clfr_k_pred.squeeze(), src_y))
+                trg_reps_list_chnl = self.feature_extractor.fetch_individual_reps(trg_x)
+                align_loss = 0
+                for k in range(0, self.true_input_channel):
+                    align_loss_k = self.sink(src_reps_list_chnl[k], trg_reps_list_chnl[k])
+
+                    align_loss = align_loss + align_loss_k[0]
+
+                domain_loss_ind = torch.sum(clfr_src_list) + torch.sum(align_loss)
+                loss_ind = self.hparams["src_cls_loss_wt"] * torch.sum(clfr_src_list) + \
+                           self.hparams["domain_loss_wt"] * domain_loss_ind
+
+
+                comb_reps_src = self.feature_extractor.combine_ind_through_attn(src_reps_list_chnl)
+                clfr_pred_comb = self.classifier(comb_reps_src)
+                loss_sup_src = self.cross_entropy(clfr_pred_comb.squeeze(), src_y)
+
+                comb_reps_trg = self.feature_extractor.combine_ind_through_attn(trg_reps_list_chnl)
+
+                domain_loss = self.sink(comb_reps_src, comb_reps_trg)[0]
+
+                loss_comb = self.hparams["src_cls_loss_wt"] * loss_sup_src + \
+                            self.hparams["domain_loss_wt"] * domain_loss + 0.3*loss_ind
+
+                dom_loss_list.append(domain_loss.item())
+                src_loss_list.append(loss_sup_src.item())
+                tloss_list.append(loss_comb.item())
+
+        # self.ema.update()
+        return {'Total_loss': np.mean(tloss_list), 'Src_cls_loss':np.mean(src_loss_list), 'Domain_loss': np.mean(dom_loss_list)}
