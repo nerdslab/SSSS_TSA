@@ -20,6 +20,12 @@ For example, to run our method on the [*WISDM*](https://www.cis.fordham.edu/wisd
 ```console
 python main.py --da_method "SSSS_TSA" --dataset "WISDM"
 ```
+To run experiments for channel corruptions on UCI-HAR dataset, please run:
+
+```console
+python main_chnl_perturb.py --da_method "SSSS_TSA" 
+```
+
 
 This code has been adapted from the  [Adatime benchmarking suite ](https://github.com/emadeldeen24/AdaTime)
 
